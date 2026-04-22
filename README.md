@@ -41,13 +41,17 @@ Add the library to your crate as a dev-dependency:
 cargo add spawn-lnd --dev
 ```
 
-Most integration tests will also use Tokio and the raw LND gRPC client returned
-by `connect_nodes()`:
+Most integration tests also need Tokio:
 
 ```sh
 cargo add tokio --dev --features macros,rt-multi-thread
-cargo add lnd_grpc_rust --dev
 ```
+
+`connect_nodes()` returns raw `lnd_grpc_rust` clients, so you can call LND RPC
+methods through those clients. Add `lnd_grpc_rust` as a dev-dependency only if
+your test code needs to name generated protobuf types directly, such as
+`lnrpc::GetInfoRequest`, `routerrpc::SendPaymentRequest`, or invoice/payment
+response enums.
 
 ## Default Images
 
