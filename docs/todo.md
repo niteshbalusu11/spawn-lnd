@@ -100,6 +100,8 @@ Primary public types:
   - `SPAWN_LND_BITCOIND_IMAGE`
   - `SPAWN_LND_KEEP_CONTAINERS`
   - `SPAWN_LND_NODES_PER_BITCOIND`
+  - `SPAWN_LND_STARTUP_RETRY_ATTEMPTS`
+  - `SPAWN_LND_STARTUP_RETRY_INTERVAL_MS`
 - Validate duplicate aliases, empty aliases, invalid image names, and invalid
   grouping values.
 
@@ -257,7 +259,7 @@ Primary public types:
 
 ### Milestone 7: Reliability And CI
 
-- [ ] Add startup timeouts and retry policy configuration.
+- [x] Add startup timeouts and retry policy configuration.
 - [x] Capture useful container logs on failure.
 - [x] Make shutdown idempotent.
 - [x] Make startup failure cleanup idempotent.

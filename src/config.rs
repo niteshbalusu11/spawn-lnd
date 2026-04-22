@@ -8,11 +8,15 @@ pub const DEFAULT_BITCOIND_IMAGE: &str = "lightninglabs/bitcoin-core:30";
 pub const DEFAULT_LND_IMAGE: &str = "lightninglabs/lnd:v0.20.1-beta";
 pub const DEFAULT_NODES_PER_BITCOIND: usize = 3;
 pub const DEFAULT_NODE_ALIAS: &str = "node-0";
+pub const DEFAULT_STARTUP_RETRY_ATTEMPTS: usize = 500;
+pub const DEFAULT_STARTUP_RETRY_INTERVAL_MS: usize = 100;
 
 pub const ENV_BITCOIND_IMAGE: &str = "SPAWN_LND_BITCOIND_IMAGE";
 pub const ENV_LND_IMAGE: &str = "SPAWN_LND_LND_IMAGE";
 pub const ENV_KEEP_CONTAINERS: &str = "SPAWN_LND_KEEP_CONTAINERS";
 pub const ENV_NODES_PER_BITCOIND: &str = "SPAWN_LND_NODES_PER_BITCOIND";
+pub const ENV_STARTUP_RETRY_ATTEMPTS: &str = "SPAWN_LND_STARTUP_RETRY_ATTEMPTS";
+pub const ENV_STARTUP_RETRY_INTERVAL_MS: &str = "SPAWN_LND_STARTUP_RETRY_INTERVAL_MS";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpawnLndConfig {
@@ -21,6 +25,7 @@ pub struct SpawnLndConfig {
     pub lnd_image: String,
     pub nodes_per_bitcoind: usize,
     pub keep_containers: bool,
+    pub startup_retry: RetryPolicy,
 }
 
 impl SpawnLndConfig {
@@ -46,6 +51,34 @@ impl SpawnLndConfig {
 
     pub fn node_aliases(&self) -> impl Iterator<Item = &str> {
         self.nodes.iter().map(|node| node.alias.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    pub attempts: usize,
+    pub interval_ms: usize,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: DEFAULT_STARTUP_RETRY_ATTEMPTS,
+            interval_ms: DEFAULT_STARTUP_RETRY_INTERVAL_MS,
+        }
+    }
+}
+
+impl RetryPolicy {
+    pub fn new(attempts: usize, interval_ms: usize) -> Self {
+        Self {
+            attempts,
+            interval_ms,
+        }
+    }
+
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.interval_ms as u64)
     }
 }
 
@@ -94,6 +127,7 @@ pub struct SpawnLndBuilder {
     lnd_image: Option<String>,
     nodes_per_bitcoind: Option<usize>,
     keep_containers: Option<bool>,
+    startup_retry: Option<RetryPolicy>,
 }
 
 impl SpawnLndBuilder {
@@ -136,6 +170,16 @@ impl SpawnLndBuilder {
         self
     }
 
+    pub fn startup_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.startup_retry = Some(policy);
+        self
+    }
+
+    pub fn startup_retry(mut self, attempts: usize, interval_ms: usize) -> Self {
+        self.startup_retry = Some(RetryPolicy::new(attempts, interval_ms));
+        self
+    }
+
     pub fn build(self) -> Result<SpawnLndConfig, ConfigError> {
         let bitcoind_image = option_or_env(
             self.bitcoind_image,
@@ -151,6 +195,15 @@ impl SpawnLndBuilder {
             Some(keep) => keep,
             None => env_bool(ENV_KEEP_CONTAINERS)?.unwrap_or(false),
         };
+        let startup_retry = match self.startup_retry {
+            Some(policy) => policy,
+            None => RetryPolicy {
+                attempts: env_usize(ENV_STARTUP_RETRY_ATTEMPTS)?
+                    .unwrap_or(DEFAULT_STARTUP_RETRY_ATTEMPTS),
+                interval_ms: env_usize(ENV_STARTUP_RETRY_INTERVAL_MS)?
+                    .unwrap_or(DEFAULT_STARTUP_RETRY_INTERVAL_MS),
+            },
+        };
 
         let nodes = if self.nodes.is_empty() {
             vec![NodeConfig::new(DEFAULT_NODE_ALIAS)]
@@ -164,6 +217,7 @@ impl SpawnLndBuilder {
             lnd_image,
             nodes_per_bitcoind,
             keep_containers,
+            startup_retry,
         };
 
         validate_config(&config)?;
@@ -201,6 +255,12 @@ pub enum ConfigError {
     #[error("nodes_per_bitcoind must be greater than zero")]
     InvalidNodesPerBitcoind,
 
+    #[error("startup retry attempts must be greater than zero")]
+    InvalidStartupRetryAttempts,
+
+    #[error("startup retry interval must be greater than zero milliseconds")]
+    InvalidStartupRetryInterval,
+
     #[error("environment variable {var} must be a positive integer, got {value}")]
     InvalidEnvUsize { var: String, value: String },
 
@@ -214,6 +274,14 @@ fn validate_config(config: &SpawnLndConfig) -> Result<(), ConfigError> {
 
     if config.nodes_per_bitcoind == 0 {
         return Err(ConfigError::InvalidNodesPerBitcoind);
+    }
+
+    if config.startup_retry.attempts == 0 {
+        return Err(ConfigError::InvalidStartupRetryAttempts);
+    }
+
+    if config.startup_retry.interval_ms == 0 {
+        return Err(ConfigError::InvalidStartupRetryInterval);
     }
 
     if config.nodes.is_empty() {
@@ -337,6 +405,7 @@ mod tests {
         assert_eq!(config.lnd_image, DEFAULT_LND_IMAGE);
         assert_eq!(config.nodes_per_bitcoind, DEFAULT_NODES_PER_BITCOIND);
         assert_eq!(config.keep_containers, false);
+        assert_eq!(config.startup_retry, super::RetryPolicy::default());
         assert_eq!(
             config.node_aliases().collect::<Vec<_>>(),
             [DEFAULT_NODE_ALIAS]
@@ -351,12 +420,14 @@ mod tests {
             .lnd_image("custom/lnd:v1")
             .nodes_per_bitcoind(3)
             .keep_containers(true)
+            .startup_retry(12, 250)
             .build()
             .expect("valid config");
 
         assert_eq!(config.bitcoind_image, "custom/bitcoin:30");
         assert_eq!(config.lnd_image, "custom/lnd:v1");
         assert_eq!(config.nodes_per_bitcoind, 3);
+        assert_eq!(config.startup_retry, super::RetryPolicy::new(12, 250));
         assert_eq!(config.chain_group_count(), 2);
         assert!(config.keep_containers);
         assert_eq!(
@@ -447,6 +518,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_startup_retry_attempts() {
+        let error = SpawnLnd::builder()
+            .startup_retry(0, 100)
+            .build()
+            .expect_err("zero attempts should fail");
+
+        assert_eq!(error, ConfigError::InvalidStartupRetryAttempts);
+    }
+
+    #[test]
+    fn rejects_zero_startup_retry_interval() {
+        let error = SpawnLnd::builder()
+            .startup_retry(1, 0)
+            .build()
+            .expect_err("zero interval should fail");
+
+        assert_eq!(error, ConfigError::InvalidStartupRetryInterval);
+    }
+
+    #[test]
     fn validates_direct_config_inputs() {
         let config = SpawnLndConfig {
             nodes: Vec::new(),
@@ -454,6 +545,7 @@ mod tests {
             lnd_image: DEFAULT_LND_IMAGE.to_string(),
             nodes_per_bitcoind: DEFAULT_NODES_PER_BITCOIND,
             keep_containers: false,
+            startup_retry: super::RetryPolicy::default(),
         };
 
         assert_eq!(config.validate(), Err(ConfigError::EmptyNodes));
@@ -467,6 +559,7 @@ mod tests {
             lnd_image: DEFAULT_LND_IMAGE.to_string(),
             nodes_per_bitcoind: 0,
             keep_containers: false,
+            startup_retry: super::RetryPolicy::default(),
         };
 
         assert_eq!(config.chain_group_count(), 0);

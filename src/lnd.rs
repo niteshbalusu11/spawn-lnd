@@ -14,7 +14,7 @@ use thiserror::Error;
 use tokio::time::{Duration, sleep};
 
 use crate::{
-    BitcoinCore, DEFAULT_LND_IMAGE,
+    BitcoinCore, DEFAULT_LND_IMAGE, RetryPolicy,
     bitcoin::BITCOIND_RPC_PORT,
     docker::{
         ContainerRole, ContainerSpec, DockerClient, DockerError, SpawnedContainer,
@@ -40,6 +40,7 @@ pub struct LndConfig {
     pub node_index: usize,
     pub image: String,
     pub extra_args: Vec<String>,
+    pub startup_retry: RetryPolicy,
 }
 
 impl LndConfig {
@@ -50,6 +51,7 @@ impl LndConfig {
             node_index,
             image: DEFAULT_LND_IMAGE.to_string(),
             extra_args: Vec::new(),
+            startup_retry: RetryPolicy::default(),
         }
     }
 
@@ -69,6 +71,11 @@ impl LndConfig {
         S: Into<String>,
     {
         self.extra_args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn startup_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.startup_retry = policy;
         self
     }
 }
@@ -109,7 +116,8 @@ impl LndDaemon {
         let container = docker.create_and_start(spec).await?;
         let container_id = container.id.clone();
         let alias = config.alias;
-        let result = Self::initialize_started(docker, container, alias.clone()).await;
+        let result =
+            Self::initialize_started(docker, container, alias.clone(), config.startup_retry).await;
 
         match result {
             Ok(daemon) => Ok(daemon),
@@ -132,6 +140,7 @@ impl LndDaemon {
         docker: &DockerClient,
         container: SpawnedContainer,
         alias: String,
+        startup_retry: RetryPolicy,
     ) -> Result<Self, LndError> {
         let rpc_port =
             container
@@ -148,11 +157,19 @@ impl LndDaemon {
                     container_port: LND_P2P_PORT,
                 })?;
         let rpc_socket = format!("127.0.0.1:{rpc_port}");
-        let cert_bytes = wait_for_file(docker, &container.id, LND_TLS_CERT_PATH).await?;
+        let cert_bytes =
+            wait_for_file(docker, &container.id, LND_TLS_CERT_PATH, &startup_retry).await?;
         let cert_hex = hex::encode(&cert_bytes);
-        let macaroon_hex =
-            init_wallet_or_read_macaroon(docker, &container.id, &cert_bytes, &rpc_socket).await?;
-        let info = wait_for_synced_get_info(&cert_hex, &macaroon_hex, &rpc_socket).await?;
+        let macaroon_hex = init_wallet_or_read_macaroon(
+            docker,
+            &container.id,
+            &cert_bytes,
+            &rpc_socket,
+            &startup_retry,
+        )
+        .await?;
+        let info =
+            wait_for_synced_get_info(&cert_hex, &macaroon_hex, &rpc_socket, &startup_retry).await?;
 
         Ok(Self {
             alias,
@@ -179,7 +196,15 @@ impl LndDaemon {
     }
 
     pub async fn wait_synced_to_chain(&self) -> Result<GetInfoResponse, LndError> {
-        wait_for_synced_get_info(&self.cert_hex, &self.macaroon_hex, &self.rpc_socket).await
+        self.wait_synced_to_chain_with_policy(&RetryPolicy::default())
+            .await
+    }
+
+    pub(crate) async fn wait_synced_to_chain_with_policy(
+        &self,
+        policy: &RetryPolicy,
+    ) -> Result<GetInfoResponse, LndError> {
+        wait_for_synced_get_info(&self.cert_hex, &self.macaroon_hex, &self.rpc_socket, policy).await
     }
 
     pub async fn new_address(&self) -> Result<String, LndError> {
@@ -708,15 +733,16 @@ async fn wait_for_file(
     docker: &DockerClient,
     container_id: &str,
     path: &str,
+    policy: &RetryPolicy,
 ) -> Result<Vec<u8>, LndError> {
     let mut last_error = None;
 
-    for _ in 0..READY_RETRY_ATTEMPTS {
+    for _ in 0..policy.attempts {
         match docker.copy_file_from_container(container_id, path).await {
             Ok(file) => return Ok(file),
             Err(error) => {
                 last_error = Some(error.to_string());
-                sleep(READY_RETRY_INTERVAL).await;
+                sleep(policy.interval()).await;
             }
         }
     }
@@ -724,7 +750,7 @@ async fn wait_for_file(
     Err(LndError::FileTimeout {
         container_id: container_id.to_string(),
         path: path.to_string(),
-        attempts: READY_RETRY_ATTEMPTS,
+        attempts: policy.attempts,
         last_error,
     })
 }
@@ -734,10 +760,11 @@ async fn init_wallet_or_read_macaroon(
     container_id: &str,
     cert_bytes: &[u8],
     socket: &str,
+    policy: &RetryPolicy,
 ) -> Result<String, LndError> {
     let mut last_error = None;
 
-    for _ in 0..READY_RETRY_ATTEMPTS {
+    for _ in 0..policy.attempts {
         let init_error = match init_wallet_once(cert_bytes, socket).await {
             Ok(macaroon) if !macaroon.is_empty() => return Ok(macaroon),
             Ok(_) => Some("InitWallet returned an empty admin macaroon".to_string()),
@@ -763,11 +790,11 @@ async fn init_wallet_or_read_macaroon(
             }
         }
 
-        sleep(READY_RETRY_INTERVAL).await;
+        sleep(policy.interval()).await;
     }
 
     Err(LndError::WalletInitTimeout {
-        attempts: READY_RETRY_ATTEMPTS,
+        attempts: policy.attempts,
         last_error,
     })
 }
@@ -819,10 +846,11 @@ async fn wait_for_synced_get_info(
     cert_hex: &str,
     macaroon_hex: &str,
     socket: &str,
+    policy: &RetryPolicy,
 ) -> Result<GetInfoResponse, LndError> {
     let mut last_error = None;
 
-    for _ in 0..READY_RETRY_ATTEMPTS {
+    for _ in 0..policy.attempts {
         match get_synced_info_once(cert_hex, macaroon_hex, socket).await {
             Ok(info) if info.synced_to_chain => return Ok(info),
             Ok(info) => {
@@ -834,11 +862,11 @@ async fn wait_for_synced_get_info(
             Err(error) => last_error = Some(error.to_string()),
         }
 
-        sleep(READY_RETRY_INTERVAL).await;
+        sleep(policy.interval()).await;
     }
 
     Err(LndError::ReadyTimeout {
-        attempts: READY_RETRY_ATTEMPTS,
+        attempts: policy.attempts,
         last_error,
     })
 }

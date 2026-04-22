@@ -5,13 +5,14 @@ use lnd_grpc_rust::{
     lnrpc::{Channel, ConnectPeerResponse},
 };
 use thiserror::Error;
-use tokio::time::{Duration, sleep};
+use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::{
     BITCOIND_P2P_PORT, BitcoinCore, BitcoinCoreConfig, BitcoinCoreError, BitcoinRpcError,
     CleanupReport, ConfigError, DEFAULT_GENERATE_ADDRESS, DockerClient, DockerError, LND_P2P_PORT,
-    LndConfig, LndDaemon, LndError, NodeConfig, SpawnLndConfig, lnd::channel_point_string,
+    LndConfig, LndDaemon, LndError, NodeConfig, RetryPolicy, SpawnLndConfig,
+    lnd::channel_point_string,
 };
 
 pub const DEFAULT_FUNDING_AMOUNT_BTC: f64 = 1.0;
@@ -19,8 +20,6 @@ pub const DEFAULT_FUNDING_CONFIRMATION_BLOCKS: u64 = 1;
 pub const DEFAULT_CHANNEL_CAPACITY_SAT: i64 = 100_000;
 pub const DEFAULT_CHANNEL_CONFIRMATION_BLOCKS: u64 = 6;
 const SATOSHIS_PER_BTC: f64 = 100_000_000.0;
-const BITCOIND_SYNC_RETRY_ATTEMPTS: usize = 500;
-const BITCOIND_SYNC_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub struct SpawnedCluster {
@@ -262,8 +261,8 @@ impl SpawnedCluster {
                 source,
             })?;
 
-        wait_bitcoind_groups_synced(&self.bitcoinds).await?;
-        wait_lnd_nodes_synced(&self.nodes, &self.node_order).await?;
+        wait_bitcoind_groups_synced(&self.bitcoinds, &self.config.startup_retry).await?;
+        wait_lnd_nodes_synced(&self.nodes, &self.node_order, &self.config.startup_retry).await?;
 
         let mut reports = Vec::with_capacity(recipients.len());
         for recipient in recipients {
@@ -356,8 +355,8 @@ impl SpawnedCluster {
                 source,
             })?;
 
-        wait_bitcoind_groups_synced(&self.bitcoinds).await?;
-        wait_lnd_nodes_synced(&self.nodes, &self.node_order).await?;
+        wait_bitcoind_groups_synced(&self.bitcoinds, &self.config.startup_retry).await?;
+        wait_lnd_nodes_synced(&self.nodes, &self.node_order, &self.config.startup_retry).await?;
 
         let from_channel = from
             .daemon
@@ -572,10 +571,10 @@ async fn spawn_inner(
     let bitcoinds = spawn_bitcoinds(&docker, &config, &cluster_id).await?;
     connect_bitcoind_groups(&bitcoinds).await?;
     prepare_primary_wallet(&bitcoinds).await?;
-    wait_bitcoind_groups_synced(&bitcoinds).await?;
+    wait_bitcoind_groups_synced(&bitcoinds, &config.startup_retry).await?;
     let (nodes, node_order) = spawn_lnd_nodes(&docker, &config, &cluster_id, &bitcoinds).await?;
-    wait_bitcoind_groups_synced(&bitcoinds).await?;
-    wait_lnd_nodes_synced(&nodes, &node_order).await?;
+    wait_bitcoind_groups_synced(&bitcoinds, &config.startup_retry).await?;
+    wait_lnd_nodes_synced(&nodes, &node_order, &config.startup_retry).await?;
 
     Ok(SpawnedCluster {
         docker,
@@ -598,7 +597,9 @@ async fn spawn_bitcoinds(
     for group_index in 0..config.chain_group_count() {
         let bitcoind = BitcoinCore::spawn(
             docker,
-            BitcoinCoreConfig::new(cluster_id, group_index).image(config.bitcoind_image.clone()),
+            BitcoinCoreConfig::new(cluster_id, group_index)
+                .image(config.bitcoind_image.clone())
+                .startup_retry_policy(config.startup_retry),
         )
         .await
         .map_err(|source| SpawnError::BitcoinCore {
@@ -645,14 +646,17 @@ async fn prepare_primary_wallet(bitcoinds: &[BitcoinCore]) -> Result<(), SpawnEr
     Ok(())
 }
 
-async fn wait_bitcoind_groups_synced(bitcoinds: &[BitcoinCore]) -> Result<(), SpawnError> {
+async fn wait_bitcoind_groups_synced(
+    bitcoinds: &[BitcoinCore],
+    policy: &RetryPolicy,
+) -> Result<(), SpawnError> {
     if bitcoinds.len() <= 1 {
         return Ok(());
     }
 
     let mut last_tips = Vec::new();
 
-    for _ in 0..BITCOIND_SYNC_RETRY_ATTEMPTS {
+    for _ in 0..policy.attempts {
         let mut tips = Vec::with_capacity(bitcoinds.len());
 
         for (group_index, bitcoind) in bitcoinds.iter().enumerate() {
@@ -678,11 +682,11 @@ async fn wait_bitcoind_groups_synced(bitcoinds: &[BitcoinCore]) -> Result<(), Sp
             return Ok(());
         }
 
-        sleep(BITCOIND_SYNC_RETRY_INTERVAL).await;
+        sleep(policy.interval()).await;
     }
 
     Err(SpawnError::BitcoinSyncTimeout {
-        attempts: BITCOIND_SYNC_RETRY_ATTEMPTS,
+        attempts: policy.attempts,
         last_tips,
     })
 }
@@ -699,7 +703,7 @@ async fn spawn_lnd_nodes(
     for (node_index, node_config) in config.nodes.iter().enumerate() {
         let chain_group_index = chain_group_index(node_index, config.nodes_per_bitcoind);
         let bitcoind = &bitcoinds[chain_group_index];
-        let lnd_config = lnd_config(cluster_id, node_index, node_config, &config.lnd_image);
+        let lnd_config = lnd_config(cluster_id, node_index, node_config, config);
         let daemon = LndDaemon::spawn_with_startup_cleanup(
             docker,
             bitcoind,
@@ -711,7 +715,7 @@ async fn spawn_lnd_nodes(
             alias: node_config.alias.clone(),
             source,
         })?;
-        wait_bitcoind_groups_synced(bitcoinds).await?;
+        wait_bitcoind_groups_synced(bitcoinds, &config.startup_retry).await?;
         let node = SpawnedNode::new(node_index, chain_group_index, daemon);
 
         node_order.push(node.alias.clone());
@@ -724,11 +728,12 @@ async fn spawn_lnd_nodes(
 async fn wait_lnd_nodes_synced(
     nodes: &HashMap<String, SpawnedNode>,
     node_order: &[String],
+    policy: &RetryPolicy,
 ) -> Result<(), SpawnError> {
     for alias in node_order {
         let node = &nodes[alias];
         node.daemon
-            .wait_synced_to_chain()
+            .wait_synced_to_chain_with_policy(policy)
             .await
             .map_err(|source| SpawnError::Lnd {
                 alias: alias.clone(),
@@ -743,11 +748,12 @@ fn lnd_config(
     cluster_id: &str,
     node_index: usize,
     node_config: &NodeConfig,
-    image: &str,
+    config: &SpawnLndConfig,
 ) -> LndConfig {
     LndConfig::new(cluster_id, node_config.alias.clone(), node_index)
-        .image(image)
+        .image(config.lnd_image.clone())
         .extra_args(node_config.lnd_args.clone())
+        .startup_retry_policy(config.startup_retry)
 }
 
 fn chain_group_index(node_index: usize, nodes_per_bitcoind: usize) -> usize {
@@ -823,7 +829,7 @@ fn empty_cleanup_report() -> CleanupReport {
 mod tests {
     use super::{already_connected_response, btc_to_sat, chain_group_index, lnd_config};
     use crate::LndError;
-    use crate::NodeConfig;
+    use crate::{NodeConfig, RetryPolicy, SpawnLndConfig};
 
     #[test]
     fn assigns_nodes_to_chain_groups() {
@@ -837,13 +843,22 @@ mod tests {
     #[test]
     fn builds_lnd_config_from_node_config() {
         let node = NodeConfig::new("alice").with_lnd_args(["--alias=Alice", "--color=#3399ff"]);
-        let config = lnd_config("cluster-1", 2, &node, "custom/lnd:v1");
+        let spawn_config = SpawnLndConfig {
+            nodes: vec![node.clone()],
+            bitcoind_image: "custom/bitcoin:30".to_string(),
+            lnd_image: "custom/lnd:v1".to_string(),
+            nodes_per_bitcoind: 3,
+            keep_containers: false,
+            startup_retry: RetryPolicy::new(12, 250),
+        };
+        let config = lnd_config("cluster-1", 2, &node, &spawn_config);
 
         assert_eq!(config.cluster_id, "cluster-1");
         assert_eq!(config.alias, "alice");
         assert_eq!(config.node_index, 2);
         assert_eq!(config.image, "custom/lnd:v1");
         assert_eq!(config.extra_args, ["--alias=Alice", "--color=#3399ff"]);
+        assert_eq!(config.startup_retry, RetryPolicy::new(12, 250));
     }
 
     #[test]

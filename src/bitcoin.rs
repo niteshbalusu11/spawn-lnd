@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use thiserror::Error;
-use tokio::time::{Duration, sleep};
+use tokio::time::sleep;
 
 use crate::{
-    DEFAULT_BITCOIND_IMAGE,
+    DEFAULT_BITCOIND_IMAGE, RetryPolicy,
     docker::{
         ContainerRole, ContainerSpec, DockerClient, DockerError, SpawnedContainer,
         managed_container_labels,
@@ -20,9 +20,6 @@ pub const DEFAULT_BITCOIN_WALLET_MATURITY_BLOCKS: u64 = 150;
 pub const BITCOIND_RPC_PORT: u16 = 18443;
 pub const BITCOIND_P2P_PORT: u16 = 18444;
 
-const READY_RETRY_ATTEMPTS: usize = 100;
-const READY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
-
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -30,6 +27,7 @@ pub struct BitcoinCoreConfig {
     pub cluster_id: String,
     pub group_index: usize,
     pub image: String,
+    pub startup_retry: RetryPolicy,
 }
 
 impl BitcoinCoreConfig {
@@ -38,11 +36,17 @@ impl BitcoinCoreConfig {
             cluster_id: cluster_id.into(),
             group_index,
             image: DEFAULT_BITCOIND_IMAGE.to_string(),
+            startup_retry: RetryPolicy::default(),
         }
     }
 
     pub fn image(mut self, image: impl Into<String>) -> Self {
         self.image = image.into();
+        self
+    }
+
+    pub fn startup_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.startup_retry = policy;
         self
     }
 }
@@ -79,7 +83,7 @@ impl BitcoinCore {
             }
         };
 
-        if let Err(source) = core.wait_ready().await {
+        if let Err(source) = core.wait_ready_with_policy(&config.startup_retry).await {
             let logs = docker.container_logs(&core.container.id).await.ok();
             let container_id = core.container.id.clone();
             let _ = docker.rollback_containers([container_id.clone()]).await;
@@ -123,20 +127,27 @@ impl BitcoinCore {
     }
 
     pub async fn wait_ready(&self) -> Result<BlockchainInfo, BitcoinCoreError> {
+        self.wait_ready_with_policy(&RetryPolicy::default()).await
+    }
+
+    async fn wait_ready_with_policy(
+        &self,
+        policy: &RetryPolicy,
+    ) -> Result<BlockchainInfo, BitcoinCoreError> {
         let mut last_error = None;
 
-        for _ in 0..READY_RETRY_ATTEMPTS {
+        for _ in 0..policy.attempts {
             match self.rpc.get_blockchain_info().await {
                 Ok(info) => return Ok(info),
                 Err(error) => {
                     last_error = Some(error);
-                    sleep(READY_RETRY_INTERVAL).await;
+                    sleep(policy.interval()).await;
                 }
             }
         }
 
         Err(BitcoinCoreError::ReadyTimeout {
-            attempts: READY_RETRY_ATTEMPTS,
+            attempts: policy.attempts,
             last_error: last_error.map(|error| error.to_string()),
         })
     }

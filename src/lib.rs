@@ -23,8 +23,10 @@ pub use cluster::{
 };
 pub use config::{
     ConfigError, DEFAULT_BITCOIND_IMAGE, DEFAULT_LND_IMAGE, DEFAULT_NODE_ALIAS,
-    DEFAULT_NODES_PER_BITCOIND, ENV_BITCOIND_IMAGE, ENV_KEEP_CONTAINERS, ENV_LND_IMAGE,
-    ENV_NODES_PER_BITCOIND, NodeConfig, SpawnLnd, SpawnLndBuilder, SpawnLndConfig,
+    DEFAULT_NODES_PER_BITCOIND, DEFAULT_STARTUP_RETRY_ATTEMPTS, DEFAULT_STARTUP_RETRY_INTERVAL_MS,
+    ENV_BITCOIND_IMAGE, ENV_KEEP_CONTAINERS, ENV_LND_IMAGE, ENV_NODES_PER_BITCOIND,
+    ENV_STARTUP_RETRY_ATTEMPTS, ENV_STARTUP_RETRY_INTERVAL_MS, NodeConfig, RetryPolicy, SpawnLnd,
+    SpawnLndBuilder, SpawnLndConfig,
 };
 pub use docker::{
     CleanupFailure, CleanupReport, ContainerRole, ContainerSpec, DockerClient, DockerError,
