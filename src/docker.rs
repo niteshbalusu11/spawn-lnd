@@ -321,10 +321,9 @@ impl DockerClient {
             .docker
             .stop_container(container_id, Some(stop_options))
             .await
+            && !is_ignorable_stop_error(&source)
         {
-            if !is_ignorable_stop_error(&source) {
-                return Err(CleanupFailure::from_error(container_id, "stop", source));
-            }
+            return Err(CleanupFailure::from_error(container_id, "stop", source));
         }
 
         let remove_options = RemoveContainerOptionsBuilder::new()
@@ -336,10 +335,9 @@ impl DockerClient {
             .docker
             .remove_container(container_id, Some(remove_options))
             .await
+            && !is_not_found_error(&source)
         {
-            if !is_not_found_error(&source) {
-                return Err(CleanupFailure::from_error(container_id, "remove", source));
-            }
+            return Err(CleanupFailure::from_error(container_id, "remove", source));
         }
 
         Ok(())
@@ -739,12 +737,8 @@ fn label_filters(labels: impl IntoIterator<Item = String>) -> HashMap<String, Ve
     HashMap::from([("label".to_string(), labels.into_iter().collect())])
 }
 
-fn exposed_ports(ports: &[u16]) -> HashMap<String, HashMap<(), ()>> {
-    ports
-        .iter()
-        .copied()
-        .map(|port| (tcp_port_key(port), HashMap::new()))
-        .collect()
+fn exposed_ports(ports: &[u16]) -> Vec<String> {
+    ports.iter().copied().map(tcp_port_key).collect()
 }
 
 fn port_bindings(ports: &[u16]) -> PortMap {
@@ -771,18 +765,13 @@ fn container_ip_address(
     network_settings: Option<&bollard::models::NetworkSettings>,
 ) -> Option<String> {
     network_settings
-        .and_then(|settings| settings.ip_address.clone())
-        .filter(|ip| !ip.is_empty())
-        .or_else(|| {
-            network_settings
-                .and_then(|settings| settings.networks.as_ref())
-                .and_then(|networks| {
-                    networks
-                        .values()
-                        .filter_map(|endpoint| endpoint.ip_address.as_ref())
-                        .find(|ip| !ip.is_empty())
-                        .cloned()
-                })
+        .and_then(|settings| settings.networks.as_ref())
+        .and_then(|networks| {
+            networks
+                .values()
+                .filter_map(|endpoint| endpoint.ip_address.as_ref())
+                .find(|ip| !ip.is_empty())
+                .cloned()
         })
 }
 
@@ -962,7 +951,11 @@ mod tests {
         );
         assert_eq!(host_config.auto_remove, Some(false));
         assert_eq!(host_config.network_mode.as_deref(), Some("bridge"));
-        assert!(body.exposed_ports.unwrap().contains_key("18443/tcp"));
+        assert!(
+            body.exposed_ports
+                .unwrap()
+                .contains(&"18443/tcp".to_string())
+        );
 
         let binding = port_bindings
             .get("18443/tcp")

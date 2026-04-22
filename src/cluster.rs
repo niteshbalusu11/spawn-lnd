@@ -75,7 +75,7 @@ impl SpawnedCluster {
                     .map_err(|source| SpawnError::StartupCleanup {
                         cluster_id,
                         startup_error: error.to_string(),
-                        source,
+                        source: Box::new(source),
                     })?;
                 Err(error)
             }
@@ -142,7 +142,7 @@ impl SpawnedCluster {
             .or_else(|error| already_connected_response(error, &to.daemon.public_key))
             .map_err(|source| SpawnError::Lnd {
                 alias: from_alias.to_string(),
-                source,
+                source: Box::new(source),
             })?;
 
         Ok(PeerConnection {
@@ -220,7 +220,7 @@ impl SpawnedCluster {
                 .await
                 .map_err(|source| SpawnError::Lnd {
                     alias: alias.clone(),
-                    source,
+                    source: Box::new(source),
                 })?
                 .confirmed_balance;
             let starting_utxos = node
@@ -229,7 +229,7 @@ impl SpawnedCluster {
                 .await
                 .map_err(|source| SpawnError::Lnd {
                     alias: alias.clone(),
-                    source,
+                    source: Box::new(source),
                 })?;
             let starting_utxo_total_sat: i64 =
                 starting_utxos.iter().map(|utxo| utxo.amount_sat).sum();
@@ -245,7 +245,7 @@ impl SpawnedCluster {
                 .await
                 .map_err(|source| SpawnError::Lnd {
                     alias: alias.clone(),
-                    source,
+                    source: Box::new(source),
                 })?;
 
             amounts.insert(address.clone(), amount_btc);
@@ -268,7 +268,7 @@ impl SpawnedCluster {
             .await
             .map_err(|source| SpawnError::BitcoinRpc {
                 group_index: 0,
-                source,
+                source: Box::new(source),
             })?;
         let confirmation_blocks = funder
             .rpc
@@ -279,7 +279,7 @@ impl SpawnedCluster {
             .await
             .map_err(|source| SpawnError::BitcoinRpc {
                 group_index: 0,
-                source,
+                source: Box::new(source),
             })?;
 
         wait_bitcoind_groups_synced(&self.bitcoinds, &self.config.startup_retry).await?;
@@ -294,7 +294,7 @@ impl SpawnedCluster {
                 .await
                 .map_err(|source| SpawnError::Lnd {
                     alias: recipient.alias.clone(),
-                    source,
+                    source: Box::new(source),
                 })?;
             let utxos = node
                 .daemon
@@ -302,7 +302,7 @@ impl SpawnedCluster {
                 .await
                 .map_err(|source| SpawnError::Lnd {
                     alias: recipient.alias.clone(),
-                    source,
+                    source: Box::new(source),
                 })?;
             let spendable_utxo_total_sat = utxos.iter().map(|utxo| utxo.amount_sat).sum();
 
@@ -350,12 +350,12 @@ impl SpawnedCluster {
             .await
             .map_err(|source| SpawnError::Lnd {
                 alias: from_alias.to_string(),
-                source,
+                source: Box::new(source),
             })?;
         let channel_point =
             channel_point_string(&channel_point).map_err(|source| SpawnError::Lnd {
                 alias: from_alias.to_string(),
-                source,
+                source: Box::new(source),
             })?;
 
         from.daemon
@@ -363,7 +363,7 @@ impl SpawnedCluster {
             .await
             .map_err(|source| SpawnError::Lnd {
                 alias: from_alias.to_string(),
-                source,
+                source: Box::new(source),
             })?;
 
         let confirmation_blocks = bitcoind
@@ -375,7 +375,7 @@ impl SpawnedCluster {
             .await
             .map_err(|source| SpawnError::BitcoinRpc {
                 group_index: from.chain_group_index,
-                source,
+                source: Box::new(source),
             })?;
 
         wait_bitcoind_groups_synced(&self.bitcoinds, &self.config.startup_retry).await?;
@@ -387,7 +387,7 @@ impl SpawnedCluster {
             .await
             .map_err(|source| SpawnError::Lnd {
                 alias: from_alias.to_string(),
-                source,
+                source: Box::new(source),
             })?;
         let to_channel = to
             .daemon
@@ -395,7 +395,7 @@ impl SpawnedCluster {
             .await
             .map_err(|source| SpawnError::Lnd {
                 alias: to_alias.to_string(),
-                source,
+                source: Box::new(source),
             })?;
 
         Ok(ChannelReport {
@@ -427,6 +427,12 @@ impl SpawnedCluster {
             .ok_or_else(|| SpawnError::UnknownNode {
                 alias: alias.to_string(),
             })
+    }
+}
+
+impl From<DockerError> for SpawnError {
+    fn from(source: DockerError) -> Self {
+        Self::Docker(Box::new(source))
     }
 }
 
@@ -563,7 +569,7 @@ pub enum SpawnError {
 
     /// Docker operation failed.
     #[error(transparent)]
-    Docker(#[from] DockerError),
+    Docker(#[from] Box<DockerError>),
 
     /// Failed to spawn a Bitcoin Core chain group.
     #[error("failed to spawn Bitcoin Core chain group {group_index}")]
@@ -571,7 +577,7 @@ pub enum SpawnError {
         /// Chain group index.
         group_index: usize,
         /// Underlying Bitcoin Core error.
-        source: BitcoinCoreError,
+        source: Box<BitcoinCoreError>,
     },
 
     /// Failed to connect two Bitcoin Core chain groups.
@@ -582,7 +588,7 @@ pub enum SpawnError {
         /// Destination chain group index.
         to_group: usize,
         /// Underlying Bitcoin RPC error.
-        source: BitcoinRpcError,
+        source: Box<BitcoinRpcError>,
     },
 
     /// Bitcoin Core RPC failed for a chain group.
@@ -591,7 +597,7 @@ pub enum SpawnError {
         /// Chain group index.
         group_index: usize,
         /// Underlying Bitcoin RPC error.
-        source: BitcoinRpcError,
+        source: Box<BitcoinRpcError>,
     },
 
     /// Bitcoin Core chain groups did not converge on a common tip.
@@ -639,7 +645,7 @@ pub enum SpawnError {
         /// Node alias.
         alias: String,
         /// Underlying LND error.
-        source: LndError,
+        source: Box<LndError>,
     },
 
     /// Connecting to all LND nodes failed.
@@ -656,7 +662,7 @@ pub enum SpawnError {
         /// Original startup error as text.
         startup_error: String,
         /// Cleanup failure.
-        source: DockerError,
+        source: Box<DockerError>,
     },
 }
 
@@ -701,7 +707,7 @@ async fn spawn_bitcoinds(
         .await
         .map_err(|source| SpawnError::BitcoinCore {
             group_index,
-            source,
+            source: Box::new(source),
         })?;
         bitcoinds.push(bitcoind);
     }
@@ -723,7 +729,7 @@ async fn connect_bitcoind_groups(bitcoinds: &[BitcoinCore]) -> Result<(), SpawnE
                 .map_err(|source| SpawnError::BitcoinPeer {
                     from_group,
                     to_group,
-                    source,
+                    source: Box::new(source),
                 })?;
         }
     }
@@ -737,7 +743,7 @@ async fn prepare_primary_wallet(bitcoinds: &[BitcoinCore]) -> Result<(), SpawnEr
         .await
         .map_err(|source| SpawnError::BitcoinCore {
             group_index: 0,
-            source,
+            source: Box::new(source),
         })?;
 
     Ok(())
@@ -760,7 +766,7 @@ async fn wait_bitcoind_groups_synced(
             let info = bitcoind.rpc.get_blockchain_info().await.map_err(|source| {
                 SpawnError::BitcoinRpc {
                     group_index,
-                    source,
+                    source: Box::new(source),
                 }
             })?;
             tips.push((info.blocks, info.bestblockhash));
@@ -810,7 +816,7 @@ async fn spawn_lnd_nodes(
         .await
         .map_err(|source| SpawnError::Lnd {
             alias: node_config.alias.clone(),
-            source,
+            source: Box::new(source),
         })?;
         wait_bitcoind_groups_synced(bitcoinds, &config.startup_retry).await?;
         let node = SpawnedNode::new(node_index, chain_group_index, daemon);
@@ -834,7 +840,7 @@ async fn wait_lnd_nodes_synced(
             .await
             .map_err(|source| SpawnError::Lnd {
                 alias: alias.clone(),
-                source,
+                source: Box::new(source),
             })?;
     }
 

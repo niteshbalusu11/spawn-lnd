@@ -489,7 +489,7 @@ mod tests {
         assert_eq!(config.bitcoind_image, DEFAULT_BITCOIND_IMAGE);
         assert_eq!(config.lnd_image, DEFAULT_LND_IMAGE);
         assert_eq!(config.nodes_per_bitcoind, DEFAULT_NODES_PER_BITCOIND);
-        assert_eq!(config.keep_containers, false);
+        assert!(!config.keep_containers);
         assert_eq!(config.startup_retry, super::RetryPolicy::default());
         assert_eq!(
             config.node_aliases().collect::<Vec<_>>(),
