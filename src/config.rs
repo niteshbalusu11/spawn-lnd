@@ -4,43 +4,66 @@ use thiserror::Error;
 
 use crate::cluster::{SpawnError, SpawnedCluster};
 
+/// Default Bitcoin Core Docker image used for new clusters.
 pub const DEFAULT_BITCOIND_IMAGE: &str = "lightninglabs/bitcoin-core:30";
+/// Default LND Docker image used for new clusters.
 pub const DEFAULT_LND_IMAGE: &str = "lightninglabs/lnd:v0.20.1-beta";
+/// Default number of LND nodes assigned to each Bitcoin Core regtest backend.
 pub const DEFAULT_NODES_PER_BITCOIND: usize = 3;
+/// Default node alias used when a builder is spawned without explicit nodes.
 pub const DEFAULT_NODE_ALIAS: &str = "node-0";
+/// Default retry count for Docker and daemon readiness polling.
 pub const DEFAULT_STARTUP_RETRY_ATTEMPTS: usize = 500;
+/// Default delay between readiness retry attempts.
 pub const DEFAULT_STARTUP_RETRY_INTERVAL_MS: usize = 100;
 
+/// Environment variable overriding the Bitcoin Core image.
 pub const ENV_BITCOIND_IMAGE: &str = "SPAWN_LND_BITCOIND_IMAGE";
+/// Environment variable overriding the LND image.
 pub const ENV_LND_IMAGE: &str = "SPAWN_LND_LND_IMAGE";
+/// Environment variable preserving containers after failure or shutdown.
 pub const ENV_KEEP_CONTAINERS: &str = "SPAWN_LND_KEEP_CONTAINERS";
+/// Environment variable overriding the number of LND nodes per Bitcoin Core.
 pub const ENV_NODES_PER_BITCOIND: &str = "SPAWN_LND_NODES_PER_BITCOIND";
+/// Environment variable overriding readiness retry attempts.
 pub const ENV_STARTUP_RETRY_ATTEMPTS: &str = "SPAWN_LND_STARTUP_RETRY_ATTEMPTS";
+/// Environment variable overriding readiness retry interval milliseconds.
 pub const ENV_STARTUP_RETRY_INTERVAL_MS: &str = "SPAWN_LND_STARTUP_RETRY_INTERVAL_MS";
 
+/// Complete cluster configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpawnLndConfig {
+    /// LND node definitions, in spawn order.
     pub nodes: Vec<NodeConfig>,
+    /// Docker image for Bitcoin Core containers.
     pub bitcoind_image: String,
+    /// Docker image for LND containers.
     pub lnd_image: String,
+    /// Number of LND nodes backed by each Bitcoin Core container.
     pub nodes_per_bitcoind: usize,
+    /// Whether cluster shutdown and startup rollback should preserve containers.
     pub keep_containers: bool,
+    /// Retry policy used for daemon startup and readiness checks.
     pub startup_retry: RetryPolicy,
 }
 
 impl SpawnLndConfig {
+    /// Create a builder using defaults and environment overrides.
     pub fn builder() -> SpawnLndBuilder {
         SpawnLndBuilder::default()
     }
 
+    /// Spawn a Docker-backed cluster from this configuration.
     pub async fn spawn(self) -> Result<SpawnedCluster, SpawnError> {
         SpawnedCluster::spawn(self).await
     }
 
+    /// Validate this configuration without spawning containers.
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_config(self)
     }
 
+    /// Return the number of Bitcoin Core chain groups implied by this config.
     pub fn chain_group_count(&self) -> usize {
         if self.nodes_per_bitcoind == 0 {
             return 0;
@@ -49,14 +72,18 @@ impl SpawnLndConfig {
         self.nodes.len().div_ceil(self.nodes_per_bitcoind)
     }
 
+    /// Iterate configured LND aliases in spawn order.
     pub fn node_aliases(&self) -> impl Iterator<Item = &str> {
         self.nodes.iter().map(|node| node.alias.as_str())
     }
 }
 
+/// Retry parameters for startup and readiness polling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RetryPolicy {
+    /// Number of attempts before timing out.
     pub attempts: usize,
+    /// Delay between attempts, in milliseconds.
     pub interval_ms: usize,
 }
 
@@ -70,6 +97,7 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// Create a retry policy from an attempt count and interval.
     pub fn new(attempts: usize, interval_ms: usize) -> Self {
         Self {
             attempts,
@@ -77,18 +105,23 @@ impl RetryPolicy {
         }
     }
 
+    /// Return the interval as a [`std::time::Duration`].
     pub fn interval(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.interval_ms as u64)
     }
 }
 
+/// Per-node LND configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeConfig {
+    /// Stable alias used to address the node through the cluster API.
     pub alias: String,
+    /// Extra command-line flags appended to the LND container command.
     pub lnd_args: Vec<String>,
 }
 
 impl NodeConfig {
+    /// Create a node configuration with the given alias.
     pub fn new(alias: impl Into<String>) -> Self {
         Self {
             alias: alias.into(),
@@ -96,11 +129,13 @@ impl NodeConfig {
         }
     }
 
+    /// Append one extra LND command-line argument.
     pub fn with_lnd_arg(mut self, arg: impl Into<String>) -> Self {
         self.lnd_args.push(arg.into());
         self
     }
 
+    /// Append multiple extra LND command-line arguments.
     pub fn with_lnd_args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -111,15 +146,18 @@ impl NodeConfig {
     }
 }
 
+/// Entry point for building and spawning a cluster.
 #[derive(Clone, Debug, Default)]
 pub struct SpawnLnd;
 
 impl SpawnLnd {
+    /// Create a new [`SpawnLndBuilder`].
     pub fn builder() -> SpawnLndBuilder {
         SpawnLndConfig::builder()
     }
 }
 
+/// Builder for [`SpawnLndConfig`].
 #[derive(Clone, Debug, Default)]
 pub struct SpawnLndBuilder {
     nodes: Vec<NodeConfig>,
@@ -131,16 +169,19 @@ pub struct SpawnLndBuilder {
 }
 
 impl SpawnLndBuilder {
+    /// Add one LND node by alias.
     pub fn node(mut self, alias: impl Into<String>) -> Self {
         self.nodes.push(NodeConfig::new(alias));
         self
     }
 
+    /// Add one fully configured LND node.
     pub fn node_config(mut self, node: NodeConfig) -> Self {
         self.nodes.push(node);
         self
     }
 
+    /// Add multiple LND nodes by alias.
     pub fn nodes<I, S>(mut self, aliases: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -150,36 +191,43 @@ impl SpawnLndBuilder {
         self
     }
 
+    /// Override the Bitcoin Core Docker image.
     pub fn bitcoind_image(mut self, image: impl Into<String>) -> Self {
         self.bitcoind_image = Some(image.into());
         self
     }
 
+    /// Override the LND Docker image.
     pub fn lnd_image(mut self, image: impl Into<String>) -> Self {
         self.lnd_image = Some(image.into());
         self
     }
 
+    /// Set how many LND nodes share each Bitcoin Core container.
     pub fn nodes_per_bitcoind(mut self, count: usize) -> Self {
         self.nodes_per_bitcoind = Some(count);
         self
     }
 
+    /// Preserve containers instead of removing them during shutdown or rollback.
     pub fn keep_containers(mut self, keep: bool) -> Self {
         self.keep_containers = Some(keep);
         self
     }
 
+    /// Set the startup retry policy.
     pub fn startup_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.startup_retry = Some(policy);
         self
     }
 
+    /// Set the startup retry policy from attempt and interval values.
     pub fn startup_retry(mut self, attempts: usize, interval_ms: usize) -> Self {
         self.startup_retry = Some(RetryPolicy::new(attempts, interval_ms));
         self
     }
 
+    /// Build and validate a [`SpawnLndConfig`].
     pub fn build(self) -> Result<SpawnLndConfig, ConfigError> {
         let bitcoind_image = option_or_env(
             self.bitcoind_image,
@@ -224,48 +272,85 @@ impl SpawnLndBuilder {
         Ok(config)
     }
 
+    /// Build a config and spawn the cluster.
     pub async fn spawn(self) -> Result<SpawnedCluster, SpawnError> {
         self.build()?.spawn().await
     }
 }
 
+/// Configuration validation error.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ConfigError {
+    /// A node alias was empty.
     #[error("node alias cannot be empty")]
     EmptyAlias,
 
+    /// A node alias contained unsupported characters.
     #[error("node alias contains unsupported characters: {0}")]
     InvalidAlias(String),
 
+    /// The same node alias was configured more than once.
     #[error("duplicate node alias: {0}")]
     DuplicateAlias(String),
 
+    /// The config contained no LND nodes.
     #[error("at least one LND node is required")]
     EmptyNodes,
 
+    /// A Docker image field was empty.
     #[error("{field} Docker image cannot be empty")]
-    EmptyImage { field: &'static str },
+    EmptyImage {
+        /// Config field name.
+        field: &'static str,
+    },
 
+    /// A Docker image field contained whitespace.
     #[error("{field} Docker image contains whitespace: {image}")]
-    ImageContainsWhitespace { field: &'static str, image: String },
+    ImageContainsWhitespace {
+        /// Config field name.
+        field: &'static str,
+        /// Invalid Docker image reference.
+        image: String,
+    },
 
+    /// A Docker image did not include a tag or digest.
     #[error("{field} Docker image must include a tag or digest: {image}")]
-    ImageMissingTagOrDigest { field: &'static str, image: String },
+    ImageMissingTagOrDigest {
+        /// Config field name.
+        field: &'static str,
+        /// Invalid Docker image reference.
+        image: String,
+    },
 
+    /// `nodes_per_bitcoind` was zero.
     #[error("nodes_per_bitcoind must be greater than zero")]
     InvalidNodesPerBitcoind,
 
+    /// Retry attempts were zero.
     #[error("startup retry attempts must be greater than zero")]
     InvalidStartupRetryAttempts,
 
+    /// Retry interval was zero.
     #[error("startup retry interval must be greater than zero milliseconds")]
     InvalidStartupRetryInterval,
 
+    /// An integer environment override could not be parsed.
     #[error("environment variable {var} must be a positive integer, got {value}")]
-    InvalidEnvUsize { var: String, value: String },
+    InvalidEnvUsize {
+        /// Environment variable name.
+        var: String,
+        /// Invalid environment variable value.
+        value: String,
+    },
 
+    /// A boolean environment override could not be parsed.
     #[error("environment variable {var} must be a boolean, got {value}")]
-    InvalidEnvBool { var: String, value: String },
+    InvalidEnvBool {
+        /// Environment variable name.
+        var: String,
+        /// Invalid environment variable value.
+        value: String,
+    },
 }
 
 fn validate_config(config: &SpawnLndConfig) -> Result<(), ConfigError> {

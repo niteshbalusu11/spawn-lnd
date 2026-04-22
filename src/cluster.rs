@@ -15,12 +15,17 @@ use crate::{
     lnd::channel_point_string,
 };
 
+/// Default on-chain funding amount sent to each LND node.
 pub const DEFAULT_FUNDING_AMOUNT_BTC: f64 = 1.0;
+/// Default number of blocks mined after funding transactions.
 pub const DEFAULT_FUNDING_CONFIRMATION_BLOCKS: u64 = 1;
+/// Default public channel capacity opened by [`SpawnedCluster::open_channel`].
 pub const DEFAULT_CHANNEL_CAPACITY_SAT: i64 = 100_000;
+/// Default number of blocks mined after opening a channel.
 pub const DEFAULT_CHANNEL_CONFIRMATION_BLOCKS: u64 = 6;
 const SATOSHIS_PER_BTC: f64 = 100_000_000.0;
 
+/// A running regtest cluster containing Bitcoin Core and LND containers.
 #[derive(Debug)]
 pub struct SpawnedCluster {
     docker: DockerClient,
@@ -33,12 +38,14 @@ pub struct SpawnedCluster {
 }
 
 impl SpawnedCluster {
+    /// Spawn a cluster using a validated config and a default Docker connection.
     pub async fn spawn(config: SpawnLndConfig) -> Result<Self, SpawnError> {
         config.validate()?;
         let docker = DockerClient::connect().await?;
         Self::spawn_validated_with_docker(docker, config).await
     }
 
+    /// Spawn a cluster using a caller-provided Docker client.
     pub async fn spawn_with_docker(
         docker: DockerClient,
         config: SpawnLndConfig,
@@ -75,42 +82,51 @@ impl SpawnedCluster {
         }
     }
 
+    /// Return the generated cluster id used in Docker labels.
     pub fn cluster_id(&self) -> &str {
         &self.cluster_id
     }
 
+    /// Return the config used to spawn this cluster.
     pub fn config(&self) -> &SpawnLndConfig {
         &self.config
     }
 
+    /// Return all spawned Bitcoin Core chain groups.
     pub fn bitcoinds(&self) -> &[BitcoinCore] {
         &self.bitcoinds
     }
 
+    /// Look up a spawned LND node by alias.
     pub fn node(&self, alias: &str) -> Option<&SpawnedNode> {
         self.nodes.get(alias)
     }
 
+    /// Iterate spawned LND nodes in configured order.
     pub fn nodes(&self) -> impl Iterator<Item = &SpawnedNode> {
         self.node_order
             .iter()
             .filter_map(|alias| self.nodes.get(alias))
     }
 
+    /// Iterate node aliases in configured order.
     pub fn node_aliases(&self) -> impl Iterator<Item = &str> {
         self.node_order.iter().map(String::as_str)
     }
 
+    /// Build connection configs for all LND nodes.
     pub fn node_configs(&self) -> Vec<LndNodeConfig> {
         self.nodes().map(SpawnedNode::node_config).collect()
     }
 
+    /// Connect to all LND nodes with `lnd_grpc_rust`.
     pub async fn connect_nodes(&self) -> Result<LndNodeClients, SpawnError> {
         lnd_grpc_rust::connect_nodes(self.node_configs())
             .await
             .map_err(SpawnError::ConnectNodes)
     }
 
+    /// Connect one LND node to another over the Docker bridge network.
     pub async fn connect_peer(
         &self,
         from_alias: &str,
@@ -138,6 +154,7 @@ impl SpawnedCluster {
         })
     }
 
+    /// Connect every LND node to every other LND node.
     pub async fn connect_all_peers(&self) -> Result<Vec<PeerConnection>, SpawnError> {
         let mut connections = Vec::new();
 
@@ -154,11 +171,13 @@ impl SpawnedCluster {
         Ok(connections)
     }
 
+    /// Fund one LND node with [`DEFAULT_FUNDING_AMOUNT_BTC`].
     pub async fn fund_node(&self, alias: &str) -> Result<FundingReport, SpawnError> {
         self.fund_node_with_amount(alias, DEFAULT_FUNDING_AMOUNT_BTC)
             .await
     }
 
+    /// Fund one LND node with a caller-provided BTC amount.
     pub async fn fund_node_with_amount(
         &self,
         alias: &str,
@@ -168,6 +187,7 @@ impl SpawnedCluster {
         Ok(reports.remove(0))
     }
 
+    /// Batch-fund multiple LND nodes with [`DEFAULT_FUNDING_AMOUNT_BTC`] each.
     pub async fn fund_nodes<I, S>(&self, aliases: I) -> Result<Vec<FundingReport>, SpawnError>
     where
         I: IntoIterator<Item = S>,
@@ -177,6 +197,7 @@ impl SpawnedCluster {
             .await
     }
 
+    /// Batch-fund multiple LND nodes with the same caller-provided BTC amount.
     pub async fn fund_nodes_with_amount<I, S>(
         &self,
         aliases: I,
@@ -300,6 +321,7 @@ impl SpawnedCluster {
         Ok(reports)
     }
 
+    /// Open a public channel with [`DEFAULT_CHANNEL_CAPACITY_SAT`].
     pub async fn open_channel(
         &self,
         from_alias: &str,
@@ -309,6 +331,7 @@ impl SpawnedCluster {
             .await
     }
 
+    /// Open a public channel with a caller-provided satoshi capacity.
     pub async fn open_channel_with_amount(
         &self,
         from_alias: &str,
@@ -323,7 +346,7 @@ impl SpawnedCluster {
 
         let channel_point = from
             .daemon
-            .open_channel_sync(&to.daemon.public_key, local_funding_amount_sat, 0, true)
+            .open_channel_sync(&to.daemon.public_key, local_funding_amount_sat, 0)
             .await
             .map_err(|source| SpawnError::Lnd {
                 alias: from_alias.to_string(),
@@ -386,6 +409,7 @@ impl SpawnedCluster {
         })
     }
 
+    /// Stop and remove all containers in this cluster unless `keep_containers` is set.
     pub async fn shutdown(&mut self) -> Result<CleanupReport, SpawnError> {
         if self.shutdown || self.config.keep_containers {
             self.shutdown = true;
@@ -417,6 +441,7 @@ impl Drop for SpawnedCluster {
     }
 }
 
+/// A spawned LND node and its placement in the cluster.
 #[derive(Clone, Debug)]
 pub struct SpawnedNode {
     alias: String,
@@ -435,49 +460,70 @@ impl SpawnedNode {
         }
     }
 
+    /// Return the node alias.
     pub fn alias(&self) -> &str {
         &self.alias
     }
 
+    /// Return the zero-based node index in spawn order.
     pub fn node_index(&self) -> usize {
         self.node_index
     }
 
+    /// Return the Bitcoin Core chain group index backing this node.
     pub fn chain_group_index(&self) -> usize {
         self.chain_group_index
     }
 
+    /// Return the underlying LND daemon handle.
     pub fn lnd(&self) -> &LndDaemon {
         &self.daemon
     }
 
+    /// Build an `lnd_grpc_rust` node connection config for this node.
     pub fn node_config(&self) -> LndNodeConfig {
         self.daemon.node_config()
     }
 
+    /// Return the LND identity public key.
     pub fn public_key(&self) -> &str {
         &self.daemon.public_key
     }
 }
 
+/// Result of connecting one LND node to another.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerConnection {
+    /// Source node alias.
     pub from_alias: String,
+    /// Destination node alias.
     pub to_alias: String,
+    /// Destination node identity public key.
     pub public_key: String,
+    /// Destination P2P socket used for the connection.
     pub socket: String,
+    /// LND connection status string.
     pub status: String,
 }
 
+/// Result of funding an LND wallet.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FundingReport {
+    /// Funded node alias.
     pub alias: String,
+    /// On-chain address generated by the funded node.
     pub address: String,
+    /// Funding transaction id.
     pub txid: String,
+    /// Funding amount in BTC.
     pub amount_btc: f64,
+    /// Block hashes mined to confirm the funding transaction.
     pub confirmation_blocks: Vec<String>,
+    /// Confirmed LND wallet balance after funding.
     pub confirmed_balance_sat: i64,
+    /// Spendable UTXO count after funding.
     pub spendable_utxo_count: usize,
+    /// Total spendable UTXO value after funding.
     pub spendable_utxo_total_sat: i64,
 }
 
@@ -489,76 +535,127 @@ struct FundingRecipient {
     required_utxo_total_sat: i64,
 }
 
+/// Result of opening and confirming a public Lightning channel.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChannelReport {
+    /// Channel opener alias.
     pub from_alias: String,
+    /// Remote node alias.
     pub to_alias: String,
+    /// Channel point in `funding_txid:output_index` form.
     pub channel_point: String,
+    /// Local funding amount in satoshis.
     pub local_funding_amount_sat: i64,
+    /// Block hashes mined to confirm the funding transaction.
     pub confirmation_blocks: Vec<String>,
+    /// Channel as reported by the opener.
     pub from_channel: Channel,
+    /// Channel as reported by the remote node.
     pub to_channel: Channel,
 }
 
+/// Error returned by cluster lifecycle and orchestration operations.
 #[derive(Debug, Error)]
 pub enum SpawnError {
+    /// Invalid cluster configuration.
     #[error(transparent)]
     Config(#[from] ConfigError),
 
+    /// Docker operation failed.
     #[error(transparent)]
     Docker(#[from] DockerError),
 
+    /// Failed to spawn a Bitcoin Core chain group.
     #[error("failed to spawn Bitcoin Core chain group {group_index}")]
     BitcoinCore {
+        /// Chain group index.
         group_index: usize,
+        /// Underlying Bitcoin Core error.
         source: BitcoinCoreError,
     },
 
+    /// Failed to connect two Bitcoin Core chain groups.
     #[error("failed to connect Bitcoin Core chain group {from_group} to group {to_group}")]
     BitcoinPeer {
+        /// Source chain group index.
         from_group: usize,
+        /// Destination chain group index.
         to_group: usize,
+        /// Underlying Bitcoin RPC error.
         source: BitcoinRpcError,
     },
 
+    /// Bitcoin Core RPC failed for a chain group.
     #[error("Bitcoin Core RPC failed for chain group {group_index}")]
     BitcoinRpc {
+        /// Chain group index.
         group_index: usize,
+        /// Underlying Bitcoin RPC error.
         source: BitcoinRpcError,
     },
 
+    /// Bitcoin Core chain groups did not converge on a common tip.
     #[error(
         "Bitcoin Core chain groups did not sync to a common tip after {attempts} attempts; last tips: {last_tips:?}"
     )]
     BitcoinSyncTimeout {
+        /// Number of sync attempts.
         attempts: usize,
+        /// Last observed best block hashes.
         last_tips: Vec<String>,
     },
 
+    /// A Bitcoin Core container had no Docker bridge IP.
     #[error("Bitcoin Core chain group {group_index} did not expose a bridge IP address")]
-    MissingBitcoindIp { group_index: usize },
+    MissingBitcoindIp {
+        /// Chain group index.
+        group_index: usize,
+    },
 
+    /// A requested LND node alias does not exist.
     #[error("unknown LND node alias: {alias}")]
-    UnknownNode { alias: String },
+    UnknownNode {
+        /// Missing alias.
+        alias: String,
+    },
 
+    /// A funding amount was not positive and finite.
     #[error("funding amount must be positive and finite, got {amount_btc} BTC")]
-    InvalidFundingAmount { amount_btc: f64 },
+    InvalidFundingAmount {
+        /// Invalid amount in BTC.
+        amount_btc: f64,
+    },
 
+    /// An LND container had no Docker bridge IP.
     #[error("LND node {alias} did not expose a bridge IP address")]
-    MissingLndIp { alias: String },
+    MissingLndIp {
+        /// Node alias.
+        alias: String,
+    },
 
+    /// LND operation failed.
     #[error("failed to spawn LND node {alias}")]
-    Lnd { alias: String, source: LndError },
+    Lnd {
+        /// Node alias.
+        alias: String,
+        /// Underlying LND error.
+        source: LndError,
+    },
 
+    /// Connecting to all LND nodes failed.
     #[error(transparent)]
     ConnectNodes(#[from] LndConnectError),
 
+    /// Startup failed and the attempted cleanup also failed.
     #[error(
         "startup failed for cluster {cluster_id}, then cleanup failed; startup error: {startup_error}"
     )]
     StartupCleanup {
+        /// Cluster id.
         cluster_id: String,
+        /// Original startup error as text.
         startup_error: String,
+        /// Cleanup failure.
         source: DockerError,
     },
 }
