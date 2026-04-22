@@ -32,7 +32,15 @@ impl SpawnLndConfig {
         SpawnedCluster::spawn(self).await
     }
 
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_config(self)
+    }
+
     pub fn chain_group_count(&self) -> usize {
+        if self.nodes_per_bitcoind == 0 {
+            return 0;
+        }
+
         self.nodes.len().div_ceil(self.nodes_per_bitcoind)
     }
 
@@ -178,6 +186,9 @@ pub enum ConfigError {
     #[error("duplicate node alias: {0}")]
     DuplicateAlias(String),
 
+    #[error("at least one LND node is required")]
+    EmptyNodes,
+
     #[error("{field} Docker image cannot be empty")]
     EmptyImage { field: &'static str },
 
@@ -203,6 +214,10 @@ fn validate_config(config: &SpawnLndConfig) -> Result<(), ConfigError> {
 
     if config.nodes_per_bitcoind == 0 {
         return Err(ConfigError::InvalidNodesPerBitcoind);
+    }
+
+    if config.nodes.is_empty() {
+        return Err(ConfigError::EmptyNodes);
     }
 
     let mut aliases = HashSet::with_capacity(config.nodes.len());
@@ -429,5 +444,31 @@ mod tests {
             .expect_err("zero grouping should fail");
 
         assert_eq!(error, ConfigError::InvalidNodesPerBitcoind);
+    }
+
+    #[test]
+    fn validates_direct_config_inputs() {
+        let config = SpawnLndConfig {
+            nodes: Vec::new(),
+            bitcoind_image: DEFAULT_BITCOIND_IMAGE.to_string(),
+            lnd_image: DEFAULT_LND_IMAGE.to_string(),
+            nodes_per_bitcoind: DEFAULT_NODES_PER_BITCOIND,
+            keep_containers: false,
+        };
+
+        assert_eq!(config.validate(), Err(ConfigError::EmptyNodes));
+    }
+
+    #[test]
+    fn invalid_direct_config_chain_group_count_does_not_panic() {
+        let config = SpawnLndConfig {
+            nodes: Vec::new(),
+            bitcoind_image: DEFAULT_BITCOIND_IMAGE.to_string(),
+            lnd_image: DEFAULT_LND_IMAGE.to_string(),
+            nodes_per_bitcoind: 0,
+            keep_containers: false,
+        };
+
+        assert_eq!(config.chain_group_count(), 0);
     }
 }

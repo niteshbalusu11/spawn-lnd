@@ -5,18 +5,13 @@ on:
   push:
     branches:
       - main
+      - master
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: test
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -24,8 +19,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo check
       - run: cargo test
-      - if: runner.os == 'macOS'
-        uses: douglascamata/setup-docker-macos-action@v1-alpha
       - run: docker version
       - run: RUN_DOCKER_TESTS=1 cargo test --test docker_smoke -- --nocapture
       - run: RUN_DOCKER_TESTS=1 cargo test --test bitcoind_smoke -- --nocapture

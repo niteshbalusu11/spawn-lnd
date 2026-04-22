@@ -90,6 +90,15 @@ impl LndDaemon {
         bitcoind: &BitcoinCore,
         config: LndConfig,
     ) -> Result<Self, LndError> {
+        Self::spawn_with_startup_cleanup(docker, bitcoind, config, true).await
+    }
+
+    pub(crate) async fn spawn_with_startup_cleanup(
+        docker: &DockerClient,
+        bitcoind: &BitcoinCore,
+        config: LndConfig,
+        cleanup_on_startup_failure: bool,
+    ) -> Result<Self, LndError> {
         bitcoind
             .rpc
             .generate_to_address(1, DEFAULT_GENERATE_ADDRESS)
@@ -106,7 +115,9 @@ impl LndDaemon {
             Ok(daemon) => Ok(daemon),
             Err(error) => {
                 let logs = docker.container_logs(&container_id).await.ok();
-                let _ = docker.rollback_containers([container_id.clone()]).await;
+                if cleanup_on_startup_failure {
+                    let _ = docker.rollback_containers([container_id.clone()]).await;
+                }
                 Err(LndError::Startup {
                     alias,
                     container_id,

@@ -18,7 +18,7 @@ pub const DEFAULT_FUNDING_AMOUNT_BTC: f64 = 1.0;
 pub const DEFAULT_FUNDING_CONFIRMATION_BLOCKS: u64 = 1;
 pub const DEFAULT_CHANNEL_CAPACITY_SAT: i64 = 100_000;
 pub const DEFAULT_CHANNEL_CONFIRMATION_BLOCKS: u64 = 6;
-const DEFAULT_MIN_FUNDING_SAT: i64 = 1;
+const SATOSHIS_PER_BTC: f64 = 100_000_000.0;
 const BITCOIND_SYNC_RETRY_ATTEMPTS: usize = 500;
 const BITCOIND_SYNC_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -35,11 +35,20 @@ pub struct SpawnedCluster {
 
 impl SpawnedCluster {
     pub async fn spawn(config: SpawnLndConfig) -> Result<Self, SpawnError> {
+        config.validate()?;
         let docker = DockerClient::connect().await?;
-        Self::spawn_with_docker(docker, config).await
+        Self::spawn_validated_with_docker(docker, config).await
     }
 
     pub async fn spawn_with_docker(
+        docker: DockerClient,
+        config: SpawnLndConfig,
+    ) -> Result<Self, SpawnError> {
+        config.validate()?;
+        Self::spawn_validated_with_docker(docker, config).await
+    }
+
+    async fn spawn_validated_with_docker(
         docker: DockerClient,
         config: SpawnLndConfig,
     ) -> Result<Self, SpawnError> {
@@ -178,12 +187,38 @@ impl SpawnedCluster {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        let amount_sat = btc_to_sat(amount_btc)?;
         let mut recipients = Vec::new();
         let mut amounts = HashMap::new();
 
         for alias in aliases {
             let alias = alias.as_ref().to_string();
             let node = self.require_node(&alias)?;
+            let starting_balance_sat = node
+                .daemon
+                .wallet_balance(1)
+                .await
+                .map_err(|source| SpawnError::Lnd {
+                    alias: alias.clone(),
+                    source,
+                })?
+                .confirmed_balance;
+            let starting_utxos = node
+                .daemon
+                .list_unspent(1, i32::MAX)
+                .await
+                .map_err(|source| SpawnError::Lnd {
+                    alias: alias.clone(),
+                    source,
+                })?;
+            let starting_utxo_total_sat: i64 =
+                starting_utxos.iter().map(|utxo| utxo.amount_sat).sum();
+            let required_balance_sat = starting_balance_sat
+                .checked_add(amount_sat)
+                .ok_or(SpawnError::InvalidFundingAmount { amount_btc })?;
+            let required_utxo_total_sat = starting_utxo_total_sat
+                .checked_add(amount_sat)
+                .ok_or(SpawnError::InvalidFundingAmount { amount_btc })?;
             let address = node
                 .daemon
                 .new_address()
@@ -194,7 +229,12 @@ impl SpawnedCluster {
                 })?;
 
             amounts.insert(address.clone(), amount_btc);
-            recipients.push((alias, address));
+            recipients.push(FundingRecipient {
+                alias,
+                address,
+                required_balance_sat,
+                required_utxo_total_sat,
+            });
         }
 
         if recipients.is_empty() {
@@ -226,29 +266,29 @@ impl SpawnedCluster {
         wait_lnd_nodes_synced(&self.nodes, &self.node_order).await?;
 
         let mut reports = Vec::with_capacity(recipients.len());
-        for (alias, address) in recipients {
-            let node = self.require_node(&alias)?;
+        for recipient in recipients {
+            let node = self.require_node(&recipient.alias)?;
             let balance = node
                 .daemon
-                .wait_for_spendable_balance(DEFAULT_MIN_FUNDING_SAT)
+                .wait_for_spendable_balance(recipient.required_balance_sat)
                 .await
                 .map_err(|source| SpawnError::Lnd {
-                    alias: alias.clone(),
+                    alias: recipient.alias.clone(),
                     source,
                 })?;
             let utxos = node
                 .daemon
-                .wait_for_spendable_utxos(DEFAULT_MIN_FUNDING_SAT)
+                .wait_for_spendable_utxos(recipient.required_utxo_total_sat)
                 .await
                 .map_err(|source| SpawnError::Lnd {
-                    alias: alias.clone(),
+                    alias: recipient.alias.clone(),
                     source,
                 })?;
             let spendable_utxo_total_sat = utxos.iter().map(|utxo| utxo.amount_sat).sum();
 
             reports.push(FundingReport {
-                alias,
-                address,
+                alias: recipient.alias,
+                address: recipient.address,
                 txid: txid.clone(),
                 amount_btc,
                 confirmation_blocks: confirmation_blocks.clone(),
@@ -442,6 +482,14 @@ pub struct FundingReport {
     pub spendable_utxo_total_sat: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingRecipient {
+    alias: String,
+    address: String,
+    required_balance_sat: i64,
+    required_utxo_total_sat: i64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChannelReport {
     pub from_alias: String,
@@ -493,6 +541,9 @@ pub enum SpawnError {
 
     #[error("unknown LND node alias: {alias}")]
     UnknownNode { alias: String },
+
+    #[error("funding amount must be positive and finite, got {amount_btc} BTC")]
+    InvalidFundingAmount { amount_btc: f64 },
 
     #[error("LND node {alias} did not expose a bridge IP address")]
     MissingLndIp { alias: String },
@@ -649,12 +700,17 @@ async fn spawn_lnd_nodes(
         let chain_group_index = chain_group_index(node_index, config.nodes_per_bitcoind);
         let bitcoind = &bitcoinds[chain_group_index];
         let lnd_config = lnd_config(cluster_id, node_index, node_config, &config.lnd_image);
-        let daemon = LndDaemon::spawn(docker, bitcoind, lnd_config)
-            .await
-            .map_err(|source| SpawnError::Lnd {
-                alias: node_config.alias.clone(),
-                source,
-            })?;
+        let daemon = LndDaemon::spawn_with_startup_cleanup(
+            docker,
+            bitcoind,
+            lnd_config,
+            !config.keep_containers,
+        )
+        .await
+        .map_err(|source| SpawnError::Lnd {
+            alias: node_config.alias.clone(),
+            source,
+        })?;
         wait_bitcoind_groups_synced(bitcoinds).await?;
         let node = SpawnedNode::new(node_index, chain_group_index, daemon);
 
@@ -696,6 +752,19 @@ fn lnd_config(
 
 fn chain_group_index(node_index: usize, nodes_per_bitcoind: usize) -> usize {
     node_index / nodes_per_bitcoind
+}
+
+fn btc_to_sat(amount_btc: f64) -> Result<i64, SpawnError> {
+    if !amount_btc.is_finite() || amount_btc <= 0.0 {
+        return Err(SpawnError::InvalidFundingAmount { amount_btc });
+    }
+
+    let amount_sat = (amount_btc * SATOSHIS_PER_BTC).round();
+    if amount_sat < 1.0 || amount_sat > i64::MAX as f64 {
+        return Err(SpawnError::InvalidFundingAmount { amount_btc });
+    }
+
+    Ok(amount_sat as i64)
 }
 
 fn bitcoind_bridge_socket(
@@ -752,7 +821,7 @@ fn empty_cleanup_report() -> CleanupReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{already_connected_response, chain_group_index, lnd_config};
+    use super::{already_connected_response, btc_to_sat, chain_group_index, lnd_config};
     use crate::LndError;
     use crate::NodeConfig;
 
@@ -790,5 +859,13 @@ mod tests {
         .expect("already connected is success");
 
         assert_eq!(response.status, "already connected to pubkey");
+    }
+
+    #[test]
+    fn converts_btc_amount_to_sats() {
+        assert_eq!(btc_to_sat(1.0).expect("sats"), 100_000_000);
+        assert_eq!(btc_to_sat(0.000_000_01).expect("sats"), 1);
+        assert!(btc_to_sat(0.0).is_err());
+        assert!(btc_to_sat(f64::NAN).is_err());
     }
 }
