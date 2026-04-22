@@ -37,7 +37,14 @@ async fn e2e_smoke_spawns_two_bitcoinds_and_opens_channel_ring() -> TestResult<(
         ("carol", "dave"),
         ("dave", "alice"),
     ];
+    eprintln!("e2e smoke: spawning cluster aliases={aliases:?}");
     let mut cluster = SpawnLnd::builder().nodes(aliases).spawn().await?;
+    eprintln!(
+        "e2e smoke: cluster_id={} bitcoinds={} aliases={:?}",
+        cluster.cluster_id(),
+        cluster.bitcoinds().len(),
+        cluster.node_aliases().collect::<Vec<_>>()
+    );
 
     assert_eq!(
         cluster.bitcoinds().len(),
@@ -51,16 +58,38 @@ async fn e2e_smoke_spawns_two_bitcoinds_and_opens_channel_ring() -> TestResult<(
     assert_eq!(cluster.node("dave").expect("dave").chain_group_index(), 1);
 
     let result = async {
+        eprintln!("e2e smoke: batch funding aliases={aliases:?}");
         let fundings = cluster.fund_nodes(aliases).await?;
+        for funding in &fundings {
+            eprintln!(
+                "e2e smoke: funded {} txid={} address={} spendable_utxo_total_sat={}",
+                funding.alias, funding.txid, funding.address, funding.spendable_utxo_total_sat
+            );
+        }
 
         let mut channels = Vec::new();
         for (from, to) in ring {
-            channels.push(cluster.open_channel(from, to).await?);
+            eprintln!(
+                "e2e smoke: opening channel {from} -> {to} capacity_sat={DEFAULT_CHANNEL_CAPACITY_SAT}"
+            );
+            let channel = cluster.open_channel(from, to).await?;
+            eprintln!(
+                "e2e smoke: channel {} -> {} point={} active_from={} active_to={} blocks={:?}",
+                from,
+                to,
+                channel.channel_point,
+                channel.from_channel.active,
+                channel.to_channel.active,
+                channel.confirmation_blocks
+            );
+            channels.push(channel);
         }
 
+        eprintln!("e2e smoke: connecting raw gRPC clients");
         let mut clients = cluster.connect_nodes().await?;
         let mut infos = Vec::new();
         for alias in aliases {
+            eprintln!("e2e smoke: querying GetInfo for {alias}");
             let info = clients
                 .get_mut(alias)
                 .expect("client")
@@ -68,6 +97,13 @@ async fn e2e_smoke_spawns_two_bitcoinds_and_opens_channel_ring() -> TestResult<(
                 .get_info(lnd_grpc_rust::lnrpc::GetInfoRequest {})
                 .await?
                 .into_inner();
+            eprintln!(
+                "e2e smoke: {alias} pubkey={} synced_to_chain={} block_height={} active_channels={}",
+                info.identity_pubkey,
+                info.synced_to_chain,
+                info.block_height,
+                info.num_active_channels
+            );
 
             infos.push((
                 alias.to_string(),
@@ -81,7 +117,9 @@ async fn e2e_smoke_spawns_two_bitcoinds_and_opens_channel_ring() -> TestResult<(
             .iter()
             .map(|(alias, public_key, _, _)| (alias.clone(), public_key.clone()))
             .collect();
+        eprintln!("e2e smoke: waiting for public graph gossip for ring edges");
         wait_for_public_graph_edges(&mut clients, &public_keys, &ring).await?;
+        eprintln!("e2e smoke: public graph has all ring edges");
 
         let payments = vec![
             pay_invoice(&mut clients, "alice", "carol", 1_000).await?,
@@ -93,15 +131,25 @@ async fn e2e_smoke_spawns_two_bitcoinds_and_opens_channel_ring() -> TestResult<(
             let info = bitcoind.rpc.get_blockchain_info().await?;
             chain_tips.push((info.blocks, info.bestblockhash));
         }
-        eprintln!("e2e chain tips: {chain_tips:?}");
+        eprintln!("e2e smoke: chain tips: {chain_tips:?}");
 
         Ok::<_, Box<dyn std::error::Error>>((fundings, channels, infos, payments, chain_tips))
     }
     .await;
+    eprintln!(
+        "e2e smoke: shutting down cluster_id={}",
+        cluster.cluster_id()
+    );
     let cleanup = cluster.shutdown().await;
 
     let (fundings, channels, infos, payments, chain_tips) = result?;
     let cleanup = cleanup?;
+    eprintln!(
+        "e2e smoke: cleanup matched={} removed={} failures={}",
+        cleanup.matched,
+        cleanup.removed,
+        cleanup.failures.len()
+    );
     assert!(
         cleanup.removed >= 6,
         "expected two bitcoinds and four LND containers to be removed"
@@ -185,7 +233,7 @@ async fn wait_for_public_graph_edges(
     }
 
     let mut last_missing = Vec::new();
-    for _ in 0..120 {
+    for attempt in 1..=120 {
         let mut synced = true;
         last_missing.clear();
 
@@ -219,9 +267,16 @@ async fn wait_for_public_graph_edges(
         }
 
         if synced {
+            eprintln!("e2e smoke: graph gossip synced after attempt {attempt}");
             return Ok(());
         }
 
+        if attempt == 1 || attempt % 10 == 0 {
+            eprintln!(
+                "e2e smoke: waiting for graph gossip attempt={attempt} missing={}",
+                last_missing.join("; ")
+            );
+        }
         sleep(Duration::from_millis(500)).await;
     }
 
@@ -245,6 +300,7 @@ async fn pay_invoice(
     to_alias: &str,
     amount_sat: i64,
 ) -> TestResult<LightningPaymentReport> {
+    eprintln!("e2e smoke: creating invoice {to_alias} amount_sat={amount_sat}");
     let invoice = {
         let recipient = clients
             .get_mut(to_alias)
@@ -261,11 +317,16 @@ async fn pay_invoice(
             .into_inner()
     };
 
+    eprintln!(
+        "e2e smoke: invoice created {to_alias} payment_hash={}",
+        hex::encode(&invoice.r_hash)
+    );
     assert!(
         !invoice.payment_request.is_empty(),
         "recipient should return a BOLT11 invoice"
     );
 
+    eprintln!("e2e smoke: paying invoice {from_alias} -> {to_alias} amount_sat={amount_sat}");
     let response = {
         let payer = clients
             .get_mut(from_alias)
@@ -281,6 +342,10 @@ async fn pay_invoice(
     assert!(
         !response.payment_preimage.is_empty(),
         "settled payment should return a preimage"
+    );
+    eprintln!(
+        "e2e smoke: payment settled {from_alias} -> {to_alias} hash={} preimage={}",
+        response.payment_hash, response.payment_preimage
     );
 
     let settled_invoice = {
@@ -304,6 +369,10 @@ async fn pay_invoice(
         "recipient invoice should be settled"
     );
     assert_eq!(settled_invoice.amt_paid_sat, amount_sat);
+    eprintln!(
+        "e2e smoke: invoice settled {to_alias} amt_paid_sat={}",
+        settled_invoice.amt_paid_sat
+    );
 
     Ok(LightningPaymentReport {
         from_alias: from_alias.to_string(),
@@ -321,7 +390,8 @@ async fn send_payment_with_retry(
 ) -> TestResult<Payment> {
     let mut last_error = String::new();
 
-    for _ in 0..6 {
+    for attempt in 1..=6 {
+        eprintln!("e2e smoke: SendPaymentV2 attempt={attempt}");
         let response = payer
             .router()
             .send_payment_v2(SendPaymentRequest {
@@ -340,21 +410,38 @@ async fn send_payment_with_retry(
                     match stream.message().await {
                         Ok(Some(payment)) => match payment.status {
                             status if status == PaymentStatus::Succeeded as i32 => {
+                                eprintln!(
+                                    "e2e smoke: SendPaymentV2 succeeded attempt={attempt} hash={}",
+                                    payment.payment_hash
+                                );
                                 return Ok(payment);
                             }
                             status if status == PaymentStatus::Failed as i32 => {
                                 last_error = format_payment_failure(&payment);
+                                eprintln!(
+                                    "e2e smoke: SendPaymentV2 failed attempt={attempt}: {last_error}"
+                                );
                                 break;
                             }
-                            _ => {}
+                            status => {
+                                eprintln!(
+                                    "e2e smoke: SendPaymentV2 update attempt={attempt} status={status}"
+                                );
+                            }
                         },
                         Ok(None) => {
                             last_error =
                                 "payment stream ended before a terminal status".to_string();
+                            eprintln!(
+                                "e2e smoke: SendPaymentV2 stream ended attempt={attempt}: {last_error}"
+                            );
                             break;
                         }
                         Err(err) => {
                             last_error = err.to_string();
+                            eprintln!(
+                                "e2e smoke: SendPaymentV2 stream error attempt={attempt}: {last_error}"
+                            );
                             break;
                         }
                     }
@@ -362,6 +449,7 @@ async fn send_payment_with_retry(
             }
             Err(err) => {
                 last_error = err.to_string();
+                eprintln!("e2e smoke: SendPaymentV2 RPC error attempt={attempt}: {last_error}");
             }
         }
 
