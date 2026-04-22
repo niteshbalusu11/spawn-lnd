@@ -7,32 +7,6 @@ The crate is library-first. It owns Docker lifecycle, daemon startup, wallet
 initialization, credential extraction, and readiness checks, then returns
 connection data that works with [`lnd_grpc_rust`](https://crates.io/crates/lnd_grpc_rust).
 
-## Status
-
-Implemented:
-
-- Docker connection and labeled container lifecycle.
-- Pull-if-missing Docker images.
-- Cleanup by cluster label and rollback for partial startup failures.
-- Bitcoin Core regtest spawn and JSON-RPC client.
-- LND spawn, TLS cert extraction, wallet init, admin macaroon extraction.
-- LND readiness that requires authenticated `GetInfo` and `synced_to_chain=true`.
-- Multi-node cluster orchestration with one Bitcoin Core per three LNDs by
-  default.
-- Alias-keyed node metadata and `connect_nodes()` integration with
-  `lnd_grpc_rust`.
-- Lightning peer connection between aliases.
-- Wallet funding through a primary Bitcoin Core wallet: mine mature coinbase
-  funds once, then use wallet RPC (`sendmany` for batches) to fund LND wallets
-  and mine one confirmation block.
-- Channel opening helpers that wait for pending state, mine confirmations, and
-  wait for both sides to report the channel active.
-- Configurable startup retry policy for slower Docker hosts and CI.
-
-In progress:
-
-- Minimal CLI.
-
 ## Installation
 
 Add the library to your crate as a dev-dependency:
