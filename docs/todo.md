@@ -236,16 +236,16 @@ Primary public types:
 
 ### Milestone 5: Multi-Node Cluster
 
-- [ ] Spawn N LND nodes grouped across Bitcoin Core containers at a default
+- [x] Spawn N LND nodes grouped across Bitcoin Core containers at a default
   ratio of one bitcoind per three LND nodes.
-- [ ] Connect Bitcoin Core containers together when a cluster has multiple
+- [x] Connect Bitcoin Core containers together when a cluster has multiple
   chain groups.
-- [ ] Allocate unique host ports and internal listener args per node.
-- [ ] Return alias-keyed node metadata.
-- [ ] Implement `connect_nodes()` using `lnd_grpc_rust::connect_nodes`.
+- [x] Allocate unique host ports and internal listener args per node.
+- [x] Return alias-keyed node metadata.
+- [x] Implement `connect_nodes()` using `lnd_grpc_rust::connect_nodes`.
 - [ ] Connect Lightning peers between aliases.
 - [ ] Fund node wallets and wait for mature UTXOs.
-- [ ] Add two-node integration test.
+- [x] Add two-node integration test.
 
 ### Milestone 6: Channel Helpers
 

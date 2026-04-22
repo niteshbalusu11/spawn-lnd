@@ -19,12 +19,14 @@ Bitcoin Core and LND regtest nodes.
 
 - `src/lib.rs`: public exports.
 - `src/config.rs`: builder/config defaults and validation.
+- `src/cluster.rs`: high-level cluster orchestration, grouping, shutdown.
 - `src/docker.rs`: Docker client, labels, lifecycle, cleanup, file copy.
 - `src/bitcoin.rs`: Bitcoin Core spawn, RPC auth, JSON-RPC methods.
 - `src/lnd.rs`: LND spawn, wallet init, macaroon/cert extraction, readiness.
 - `tests/docker_smoke.rs`: gated Docker lifecycle smoke test.
 - `tests/bitcoind_smoke.rs`: gated Bitcoin Core smoke test.
 - `tests/lnd_smoke.rs`: gated LND smoke test requiring `synced_to_chain=true`.
+- `tests/cluster_smoke.rs`: gated two-node high-level cluster smoke test.
 - `docs/todo.md`: engineering plan and remaining milestones.
 
 ## Commands
@@ -41,6 +43,7 @@ Docker-backed tests are gated:
 
 ```sh
 RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --nocapture
+RUN_DOCKER_TESTS=1 cargo test --test cluster_smoke -- --nocapture
 ```
 
 Cleanup check:

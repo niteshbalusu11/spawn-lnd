@@ -17,10 +17,15 @@ Implemented:
 - Bitcoin Core regtest spawn and JSON-RPC client.
 - LND spawn, TLS cert extraction, wallet init, admin macaroon extraction.
 - LND readiness that requires authenticated `GetInfo` and `synced_to_chain=true`.
+- Multi-node cluster orchestration with one Bitcoin Core per three LNDs by
+  default.
+- Alias-keyed node metadata and `connect_nodes()` integration with
+  `lnd_grpc_rust`.
 
 In progress:
 
-- Multi-node cluster orchestration.
+- Lightning peer connection helpers.
+- Wallet funding helpers.
 - Channel setup helpers.
 - Minimal CLI.
 
@@ -32,29 +37,20 @@ In progress:
 ## Example
 
 ```rust
-use spawn_lnd::{BitcoinCore, BitcoinCoreConfig, DockerClient, LndConfig, LndDaemon};
+use spawn_lnd::SpawnLnd;
 
 #[tokio::test]
-async fn spawn_one_lnd() -> Result<(), Box<dyn std::error::Error>> {
-    let docker = DockerClient::connect().await?;
-    let cluster_id = format!("test-{}", uuid::Uuid::new_v4());
+async fn spawn_two_lnds() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cluster = SpawnLnd::builder()
+        .nodes(["alice", "bob"])
+        .spawn()
+        .await?;
 
     let result = async {
-        let bitcoind = BitcoinCore::spawn(
-            &docker,
-            BitcoinCoreConfig::new(cluster_id.clone(), 0),
-        )
-        .await?;
-
-        let lnd = LndDaemon::spawn(
-            &docker,
-            &bitcoind,
-            LndConfig::new(cluster_id.clone(), "alice", 0),
-        )
-        .await?;
-
-        let mut client = lnd.connect().await?;
-        let info = client
+        let mut clients = cluster.connect_nodes().await?;
+        let info = clients
+            .get_mut("alice")
+            .expect("alice")
             .lightning()
             .get_info(lnd_grpc_rust::lnrpc::GetInfoRequest {})
             .await?
@@ -65,7 +61,7 @@ async fn spawn_one_lnd() -> Result<(), Box<dyn std::error::Error>> {
     }
     .await;
 
-    docker.cleanup_cluster(&cluster_id).await?;
+    cluster.shutdown().await?;
     result
 }
 ```
@@ -84,6 +80,7 @@ Run Docker-backed smoke tests:
 RUN_DOCKER_TESTS=1 cargo test --test docker_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test bitcoind_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --nocapture
+RUN_DOCKER_TESTS=1 cargo test --test cluster_smoke -- --nocapture
 ```
 
 Check for leftover managed containers:

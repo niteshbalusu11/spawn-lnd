@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, env};
 use thiserror::Error;
 
+use crate::cluster::{SpawnError, SpawnedCluster};
+
 pub const DEFAULT_BITCOIND_IMAGE: &str = "lightninglabs/bitcoin-core:30";
 pub const DEFAULT_LND_IMAGE: &str = "lightninglabs/lnd:v0.20.1-beta";
 pub const DEFAULT_NODES_PER_BITCOIND: usize = 3;
@@ -24,6 +26,10 @@ pub struct SpawnLndConfig {
 impl SpawnLndConfig {
     pub fn builder() -> SpawnLndBuilder {
         SpawnLndBuilder::default()
+    }
+
+    pub async fn spawn(self) -> Result<SpawnedCluster, SpawnError> {
+        SpawnedCluster::spawn(self).await
     }
 
     pub fn chain_group_count(&self) -> usize {
@@ -154,6 +160,10 @@ impl SpawnLndBuilder {
 
         validate_config(&config)?;
         Ok(config)
+    }
+
+    pub async fn spawn(self) -> Result<SpawnedCluster, SpawnError> {
+        self.build()?.spawn().await
     }
 }
 

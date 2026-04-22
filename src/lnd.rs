@@ -155,6 +155,10 @@ impl LndDaemon {
     pub async fn connect(&self) -> Result<LndClient, LndError> {
         connect_authenticated(&self.cert_hex, &self.macaroon_hex, &self.rpc_socket).await
     }
+
+    pub async fn wait_synced_to_chain(&self) -> Result<GetInfoResponse, LndError> {
+        wait_for_synced_get_info(&self.cert_hex, &self.macaroon_hex, &self.rpc_socket).await
+    }
 }
 
 #[derive(Debug, Error)]
