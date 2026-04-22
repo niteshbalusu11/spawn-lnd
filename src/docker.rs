@@ -15,22 +15,29 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, io::Read};
 use thiserror::Error;
 
+/// Docker label key marking containers managed by this crate.
 pub const LABEL_MANAGED: &str = "spawn-lnd";
+/// Docker label value used with [`LABEL_MANAGED`].
 pub const LABEL_MANAGED_VALUE: &str = "true";
+/// Docker label key storing the generated cluster id.
 pub const LABEL_CLUSTER: &str = "spawn-lnd.cluster";
+/// Docker label key storing an LND node alias when applicable.
 pub const LABEL_NODE: &str = "spawn-lnd.node";
+/// Docker label key storing the managed container role.
 pub const LABEL_ROLE: &str = "spawn-lnd.role";
 
 const STOP_TIMEOUT_SECONDS: i32 = 10;
 const LOG_TAIL_LINES: &str = "200";
 const LOG_MAX_BYTES: usize = 64 * 1024;
 
+/// Thin async wrapper around a Bollard Docker client.
 #[derive(Clone, Debug)]
 pub struct DockerClient {
     docker: Docker,
 }
 
 impl DockerClient {
+    /// Connect to Docker using Bollard defaults and verify connectivity with `ping`.
     pub async fn connect() -> Result<Self, DockerError> {
         let docker =
             Docker::connect_with_defaults().map_err(|source| DockerError::Connect { source })?;
@@ -43,14 +50,17 @@ impl DockerClient {
         Ok(Self { docker })
     }
 
+    /// Wrap an existing Bollard Docker client.
     pub fn from_bollard(docker: Docker) -> Self {
         Self { docker }
     }
 
+    /// Access the underlying Bollard client.
     pub fn inner(&self) -> &Docker {
         &self.docker
     }
 
+    /// Ensure a Docker image exists locally, pulling it if necessary.
     pub async fn ensure_image(&self, image: &str) -> Result<ImageStatus, DockerError> {
         match self.docker.inspect_image(image).await {
             Ok(_) => return Ok(ImageStatus::AlreadyPresent),
@@ -76,6 +86,7 @@ impl DockerClient {
         Ok(ImageStatus::Pulled)
     }
 
+    /// Create and start a container from a [`ContainerSpec`].
     pub async fn create_and_start(
         &self,
         spec: ContainerSpec,
@@ -119,6 +130,7 @@ impl DockerClient {
         SpawnedContainer::from_inspect(response.id, inspect)
     }
 
+    /// Copy a single file from a container and return its bytes.
     pub async fn copy_file_from_container(
         &self,
         container_id: &str,
@@ -148,19 +160,23 @@ impl DockerClient {
         })
     }
 
+    /// Remove all managed containers with the given cluster id.
     pub async fn cleanup_cluster(&self, cluster_id: &str) -> Result<CleanupReport, DockerError> {
         self.cleanup_by_labels(cluster_label_filters(cluster_id))
             .await
     }
 
+    /// Remove all containers managed by this crate.
     pub async fn cleanup_all(&self) -> Result<CleanupReport, DockerError> {
         self.cleanup_by_labels(managed_label_filters()).await
     }
 
+    /// Return ids for all containers managed by this crate.
     pub async fn managed_container_ids(&self) -> Result<Vec<String>, DockerError> {
         self.container_ids_by_labels(managed_label_filters()).await
     }
 
+    /// Return ids for all managed containers with the given cluster id.
     pub async fn cluster_container_ids(
         &self,
         cluster_id: &str,
@@ -169,6 +185,7 @@ impl DockerClient {
             .await
     }
 
+    /// Return recent stdout/stderr logs from a container.
     pub async fn container_logs(&self, container_id: &str) -> Result<String, DockerError> {
         let options = LogsOptionsBuilder::default()
             .stdout(true)
@@ -195,10 +212,12 @@ impl DockerClient {
         Ok(logs)
     }
 
+    /// Create a rollback guard for containers created during startup.
     pub fn rollback_guard(&self) -> StartupRollback<'_> {
         StartupRollback::new(self)
     }
 
+    /// Stop and remove explicit container ids.
     pub async fn rollback_containers<I>(
         &self,
         container_ids: I,
@@ -302,10 +321,9 @@ impl DockerClient {
             .docker
             .stop_container(container_id, Some(stop_options))
             .await
+            && !is_ignorable_stop_error(&source)
         {
-            if !is_ignorable_stop_error(&source) {
-                return Err(CleanupFailure::from_error(container_id, "stop", source));
-            }
+            return Err(CleanupFailure::from_error(container_id, "stop", source));
         }
 
         let remove_options = RemoveContainerOptionsBuilder::new()
@@ -317,16 +335,16 @@ impl DockerClient {
             .docker
             .remove_container(container_id, Some(remove_options))
             .await
+            && !is_not_found_error(&source)
         {
-            if !is_not_found_error(&source) {
-                return Err(CleanupFailure::from_error(container_id, "remove", source));
-            }
+            return Err(CleanupFailure::from_error(container_id, "remove", source));
         }
 
         Ok(())
     }
 }
 
+/// Tracks containers that should be removed if startup fails.
 #[derive(Debug)]
 pub struct StartupRollback<'a> {
     docker: &'a DockerClient,
@@ -343,23 +361,28 @@ impl<'a> StartupRollback<'a> {
         }
     }
 
+    /// Record a container for later rollback.
     pub fn record(&mut self, container: &SpawnedContainer) {
         self.record_id(container.id.clone());
     }
 
+    /// Record a container id for later rollback.
     pub fn record_id(&mut self, container_id: impl Into<String>) {
         self.container_ids.push(container_id.into());
     }
 
+    /// Return currently tracked container ids.
     pub fn container_ids(&self) -> &[String] {
         &self.container_ids
     }
 
+    /// Disarm the guard and return tracked ids without removing containers.
     pub fn disarm(mut self) -> Vec<String> {
         self.disarmed = true;
         std::mem::take(&mut self.container_ids)
     }
 
+    /// Remove all tracked containers and disarm the guard.
     pub async fn rollback(mut self) -> Result<CleanupReport, DockerError> {
         self.disarmed = true;
         let container_ids = std::mem::take(&mut self.container_ids);
@@ -378,18 +401,27 @@ impl Drop for StartupRollback<'_> {
     }
 }
 
+/// Docker container creation parameters used by [`DockerClient`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ContainerSpec {
+    /// Container name.
     pub name: String,
+    /// Docker image reference.
     pub image: String,
+    /// Container command arguments.
     pub cmd: Vec<String>,
+    /// Environment variables.
     pub env: Vec<String>,
+    /// Docker labels.
     pub labels: HashMap<String, String>,
+    /// Container TCP ports to publish on random host ports.
     pub exposed_ports: Vec<u16>,
+    /// Optional Docker network mode/name.
     pub network: Option<String>,
 }
 
 impl ContainerSpec {
+    /// Create a container spec with no command, env, labels, ports, or network.
     pub fn new(name: impl Into<String>, image: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -402,6 +434,7 @@ impl ContainerSpec {
         }
     }
 
+    /// Set the container command.
     pub fn cmd<I, S>(mut self, cmd: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -411,6 +444,7 @@ impl ContainerSpec {
         self
     }
 
+    /// Set environment variables.
     pub fn env<I, S>(mut self, env: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -420,16 +454,19 @@ impl ContainerSpec {
         self
     }
 
+    /// Set Docker labels.
     pub fn labels(mut self, labels: HashMap<String, String>) -> Self {
         self.labels = labels;
         self
     }
 
+    /// Publish one container TCP port on a random host port.
     pub fn expose_port(mut self, port: u16) -> Self {
         self.exposed_ports.push(port);
         self
     }
 
+    /// Publish multiple container TCP ports on random host ports.
     pub fn expose_ports<I>(mut self, ports: I) -> Self
     where
         I: IntoIterator<Item = u16>,
@@ -438,6 +475,7 @@ impl ContainerSpec {
         self
     }
 
+    /// Set Docker network mode/name.
     pub fn network(mut self, network: impl Into<String>) -> Self {
         self.network = Some(network.into());
         self
@@ -463,11 +501,16 @@ impl ContainerSpec {
     }
 }
 
+/// Metadata for a container created by this crate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpawnedContainer {
+    /// Docker container id.
     pub id: String,
+    /// Docker container name without a leading slash.
     pub name: Option<String>,
+    /// Bridge-network IP address when Docker reports one.
     pub ip_address: Option<String>,
+    /// Mapping from container TCP port to published host TCP port.
     pub host_ports: HashMap<u16, u16>,
 }
 
@@ -484,24 +527,32 @@ impl SpawnedContainer {
         })
     }
 
+    /// Return the host port for a published container port.
     pub fn host_port(&self, container_port: u16) -> Option<u16> {
         self.host_ports.get(&container_port).copied()
     }
 }
 
+/// Role label for a managed container.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ContainerRole {
+    /// Bitcoin Core container.
     Bitcoind,
+    /// LND container.
     Lnd,
 }
 
+/// Result of ensuring an image is available locally.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ImageStatus {
+    /// The image was already present before the call.
     AlreadyPresent,
+    /// The image was pulled by the call.
     Pulled,
 }
 
 impl ContainerRole {
+    /// Return the Docker label value for this role.
     pub fn as_label_value(self) -> &'static str {
         match self {
             Self::Bitcoind => "bitcoind",
@@ -510,23 +561,32 @@ impl ContainerRole {
     }
 }
 
+/// Summary of a cleanup operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CleanupReport {
+    /// Number of containers matched for cleanup.
     pub matched: usize,
+    /// Number of containers successfully removed.
     pub removed: usize,
+    /// Per-container cleanup failures.
     pub failures: Vec<CleanupFailure>,
 }
 
 impl CleanupReport {
+    /// Return true when no cleanup failures occurred.
     pub fn is_success(&self) -> bool {
         self.failures.is_empty()
     }
 }
 
+/// Failure for one container cleanup operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CleanupFailure {
+    /// Docker container id.
     pub container_id: String,
+    /// Operation that failed, such as `stop` or `remove`.
     pub operation: String,
+    /// Error message returned by Docker.
     pub message: String,
 }
 
@@ -540,7 +600,9 @@ impl CleanupFailure {
     }
 }
 
+/// Error returned by Docker operations.
 #[derive(Debug, Error)]
+#[allow(missing_docs)]
 pub enum DockerError {
     #[error("failed to connect to Docker")]
     Connect { source: BollardError },
@@ -619,8 +681,12 @@ impl DockerError {
     }
 }
 
+/// Error wrapper used as the source for cleanup failures.
 #[derive(Debug)]
-pub struct CleanupReportError(pub CleanupReport);
+pub struct CleanupReportError(
+    /// Cleanup report containing the underlying failures.
+    pub CleanupReport,
+);
 
 impl std::fmt::Display for CleanupReportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -635,6 +701,7 @@ impl std::fmt::Display for CleanupReportError {
 
 impl std::error::Error for CleanupReportError {}
 
+/// Build the Docker labels applied to every managed container.
 pub fn managed_container_labels(
     cluster_id: &str,
     role: ContainerRole,
@@ -653,10 +720,12 @@ pub fn managed_container_labels(
     labels
 }
 
+/// Build Docker list filters that match all containers managed by this crate.
 pub fn managed_label_filters() -> HashMap<String, Vec<String>> {
     label_filters([format!("{LABEL_MANAGED}={LABEL_MANAGED_VALUE}")])
 }
 
+/// Build Docker list filters that match containers for a specific cluster.
 pub fn cluster_label_filters(cluster_id: &str) -> HashMap<String, Vec<String>> {
     label_filters([
         format!("{LABEL_MANAGED}={LABEL_MANAGED_VALUE}"),
@@ -668,12 +737,8 @@ fn label_filters(labels: impl IntoIterator<Item = String>) -> HashMap<String, Ve
     HashMap::from([("label".to_string(), labels.into_iter().collect())])
 }
 
-fn exposed_ports(ports: &[u16]) -> HashMap<String, HashMap<(), ()>> {
-    ports
-        .iter()
-        .copied()
-        .map(|port| (tcp_port_key(port), HashMap::new()))
-        .collect()
+fn exposed_ports(ports: &[u16]) -> Vec<String> {
+    ports.iter().copied().map(tcp_port_key).collect()
 }
 
 fn port_bindings(ports: &[u16]) -> PortMap {
@@ -700,18 +765,13 @@ fn container_ip_address(
     network_settings: Option<&bollard::models::NetworkSettings>,
 ) -> Option<String> {
     network_settings
-        .and_then(|settings| settings.ip_address.clone())
-        .filter(|ip| !ip.is_empty())
-        .or_else(|| {
-            network_settings
-                .and_then(|settings| settings.networks.as_ref())
-                .and_then(|networks| {
-                    networks
-                        .values()
-                        .filter_map(|endpoint| endpoint.ip_address.as_ref())
-                        .find(|ip| !ip.is_empty())
-                        .cloned()
-                })
+        .and_then(|settings| settings.networks.as_ref())
+        .and_then(|networks| {
+            networks
+                .values()
+                .filter_map(|endpoint| endpoint.ip_address.as_ref())
+                .find(|ip| !ip.is_empty())
+                .cloned()
         })
 }
 
@@ -891,7 +951,11 @@ mod tests {
         );
         assert_eq!(host_config.auto_remove, Some(false));
         assert_eq!(host_config.network_mode.as_deref(), Some("bridge"));
-        assert!(body.exposed_ports.unwrap().contains_key("18443/tcp"));
+        assert!(
+            body.exposed_ports
+                .unwrap()
+                .contains(&"18443/tcp".to_string())
+        );
 
         let binding = port_bindings
             .get("18443/tcp")

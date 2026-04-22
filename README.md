@@ -27,6 +27,7 @@ Implemented:
   and mine one confirmation block.
 - Channel opening helpers that wait for pending state, mine confirmations, and
   wait for both sides to report the channel active.
+- Configurable startup retry policy for slower Docker hosts and CI.
 
 In progress:
 
@@ -121,6 +122,29 @@ SPAWN_LND_KEEP_CONTAINERS=1 RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --
 
 Startup failures include a bounded Docker log tail in the typed error when a
 container was created before readiness failed.
+
+## Configuration
+
+The builder supports node aliases, image overrides, chain grouping, debug
+cleanup behavior, and startup retry policy:
+
+```rust
+use spawn_lnd::{RetryPolicy, SpawnLnd};
+
+let config = SpawnLnd::builder()
+    .nodes(["alice", "bob"])
+    .startup_retry_policy(RetryPolicy::new(600, 100))
+    .build()?;
+```
+
+Environment overrides:
+
+- `SPAWN_LND_BITCOIND_IMAGE`
+- `SPAWN_LND_LND_IMAGE`
+- `SPAWN_LND_NODES_PER_BITCOIND`
+- `SPAWN_LND_KEEP_CONTAINERS`
+- `SPAWN_LND_STARTUP_RETRY_ATTEMPTS`
+- `SPAWN_LND_STARTUP_RETRY_INTERVAL_MS`
 
 ## Startup Flags
 

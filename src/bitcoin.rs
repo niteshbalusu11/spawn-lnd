@@ -1,63 +1,88 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use thiserror::Error;
-use tokio::time::{Duration, sleep};
+use tokio::time::sleep;
 
 use crate::{
-    DEFAULT_BITCOIND_IMAGE,
+    DEFAULT_BITCOIND_IMAGE, RetryPolicy,
     docker::{
         ContainerRole, ContainerSpec, DockerClient, DockerError, SpawnedContainer,
         managed_container_labels,
     },
 };
 
+/// Default RPC user configured for spawned Bitcoin Core nodes.
 pub const DEFAULT_BITCOIN_RPC_USER: &str = "bitcoinrpc";
+/// Default wallet name used for mining and funding operations.
 pub const DEFAULT_BITCOIN_WALLET_NAME: &str = "spawn-lnd";
+/// Number of blocks mined to mature the default wallet's coinbase outputs.
 pub const DEFAULT_BITCOIN_WALLET_MATURITY_BLOCKS: u64 = 150;
+/// Regtest RPC port exposed by Bitcoin Core inside the Docker container.
 pub const BITCOIND_RPC_PORT: u16 = 18443;
+/// Regtest P2P port exposed by Bitcoin Core inside the Docker container.
 pub const BITCOIND_P2P_PORT: u16 = 18444;
-
-const READY_RETRY_ATTEMPTS: usize = 100;
-const READY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Configuration for one spawned Bitcoin Core regtest backend.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BitcoinCoreConfig {
+    /// Cluster identifier used in container names and labels.
     pub cluster_id: String,
+    /// Zero-based chain group index.
     pub group_index: usize,
+    /// Docker image used for this Bitcoin Core container.
     pub image: String,
+    /// Retry policy used while waiting for RPC readiness.
+    pub startup_retry: RetryPolicy,
 }
 
 impl BitcoinCoreConfig {
+    /// Create a Bitcoin Core config using the default pinned image.
     pub fn new(cluster_id: impl Into<String>, group_index: usize) -> Self {
         Self {
             cluster_id: cluster_id.into(),
             group_index,
             image: DEFAULT_BITCOIND_IMAGE.to_string(),
+            startup_retry: RetryPolicy::default(),
         }
     }
 
+    /// Override the Bitcoin Core Docker image.
     pub fn image(mut self, image: impl Into<String>) -> Self {
         self.image = image.into();
         self
     }
+
+    /// Override the readiness retry policy.
+    pub fn startup_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.startup_retry = policy;
+        self
+    }
 }
 
+/// A running Bitcoin Core container and its RPC handles.
 #[derive(Clone, Debug)]
 pub struct BitcoinCore {
+    /// Docker container metadata.
     pub container: SpawnedContainer,
+    /// RPC authentication generated for the node.
     pub auth: BitcoinRpcAuth,
+    /// RPC client for node-level methods.
     pub rpc: BitcoinRpcClient,
+    /// RPC client scoped to the default wallet.
     pub wallet_rpc: BitcoinRpcClient,
+    /// Host RPC socket, usually `127.0.0.1:<port>`.
     pub rpc_socket: String,
+    /// Host P2P socket, usually `127.0.0.1:<port>`.
     pub p2p_socket: String,
 }
 
 impl BitcoinCore {
+    /// Spawn a Bitcoin Core container and wait until RPC is ready.
     pub async fn spawn(
         docker: &DockerClient,
         config: BitcoinCoreConfig,
@@ -79,7 +104,7 @@ impl BitcoinCore {
             }
         };
 
-        if let Err(source) = core.wait_ready().await {
+        if let Err(source) = core.wait_ready_with_policy(&config.startup_retry).await {
             let logs = docker.container_logs(&core.container.id).await.ok();
             let container_id = core.container.id.clone();
             let _ = docker.rollback_containers([container_id.clone()]).await;
@@ -122,25 +147,34 @@ impl BitcoinCore {
         })
     }
 
+    /// Wait for `getblockchaininfo` to succeed using the default retry policy.
     pub async fn wait_ready(&self) -> Result<BlockchainInfo, BitcoinCoreError> {
+        self.wait_ready_with_policy(&RetryPolicy::default()).await
+    }
+
+    async fn wait_ready_with_policy(
+        &self,
+        policy: &RetryPolicy,
+    ) -> Result<BlockchainInfo, BitcoinCoreError> {
         let mut last_error = None;
 
-        for _ in 0..READY_RETRY_ATTEMPTS {
+        for _ in 0..policy.attempts {
             match self.rpc.get_blockchain_info().await {
                 Ok(info) => return Ok(info),
                 Err(error) => {
                     last_error = Some(error);
-                    sleep(READY_RETRY_INTERVAL).await;
+                    sleep(policy.interval()).await;
                 }
             }
         }
 
         Err(BitcoinCoreError::ReadyTimeout {
-            attempts: READY_RETRY_ATTEMPTS,
+            attempts: policy.attempts,
             last_error: last_error.map(|error| error.to_string()),
         })
     }
 
+    /// Create/load the default wallet and mine enough blocks to mature coinbase funds.
     pub async fn prepare_mining_wallet(&self) -> Result<Vec<String>, BitcoinCoreError> {
         self.rpc
             .ensure_wallet(DEFAULT_BITCOIN_WALLET_NAME)
@@ -159,18 +193,24 @@ impl BitcoinCore {
     }
 }
 
+/// RPC credentials for Bitcoin Core.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BitcoinRpcAuth {
+    /// RPC username.
     pub user: String,
+    /// RPC password.
     pub password: String,
+    /// Value suitable for Bitcoin Core's `-rpcauth` setting.
     pub rpcauth: String,
 }
 
 impl BitcoinRpcAuth {
+    /// Generate random credentials with [`DEFAULT_BITCOIN_RPC_USER`].
     pub fn random() -> Self {
         Self::random_with_user(DEFAULT_BITCOIN_RPC_USER)
     }
 
+    /// Generate random credentials for the given RPC user.
     pub fn random_with_user(user: impl Into<String>) -> Self {
         let user = user.into();
         let password = random_password();
@@ -185,6 +225,7 @@ impl BitcoinRpcAuth {
     }
 }
 
+/// Minimal async JSON-RPC client for Bitcoin Core regtest nodes.
 #[derive(Clone, Debug)]
 pub struct BitcoinRpcClient {
     endpoint: String,
@@ -194,6 +235,7 @@ pub struct BitcoinRpcClient {
 }
 
 impl BitcoinRpcClient {
+    /// Create a client for a host, port, and RPC credentials.
     pub fn new(
         host: impl AsRef<str>,
         port: u16,
@@ -208,10 +250,12 @@ impl BitcoinRpcClient {
         }
     }
 
+    /// Return the HTTP endpoint used by this client.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
+    /// Return a client scoped to a named Bitcoin Core wallet.
     pub fn wallet(&self, wallet_name: &str) -> Self {
         Self {
             endpoint: format!(
@@ -224,22 +268,27 @@ impl BitcoinRpcClient {
         }
     }
 
+    /// Call `getblockchaininfo`.
     pub async fn get_blockchain_info(&self) -> Result<BlockchainInfo, BitcoinRpcError> {
         self.call("getblockchaininfo", json!([])).await
     }
 
+    /// Call `listwallets`.
     pub async fn list_wallets(&self) -> Result<Vec<String>, BitcoinRpcError> {
         self.call("listwallets", json!([])).await
     }
 
+    /// Call `createwallet`.
     pub async fn create_wallet(&self, wallet_name: &str) -> Result<CreateWallet, BitcoinRpcError> {
         self.call("createwallet", json!([wallet_name])).await
     }
 
+    /// Call `loadwallet`.
     pub async fn load_wallet(&self, wallet_name: &str) -> Result<LoadWallet, BitcoinRpcError> {
         self.call("loadwallet", json!([wallet_name])).await
     }
 
+    /// Ensure a wallet is loaded, creating it if it does not already exist.
     pub async fn ensure_wallet(&self, wallet_name: &str) -> Result<(), BitcoinRpcError> {
         if self
             .list_wallets()
@@ -260,10 +309,12 @@ impl BitcoinRpcClient {
         }
     }
 
+    /// Call `getnewaddress`.
     pub async fn get_new_address(&self) -> Result<String, BitcoinRpcError> {
         self.call("getnewaddress", json!([])).await
     }
 
+    /// Mine `count` regtest blocks to `address`.
     pub async fn generate_to_address(
         &self,
         count: u64,
@@ -273,15 +324,18 @@ impl BitcoinRpcClient {
             .await
     }
 
+    /// Call `getblock` with verbosity `1`.
     pub async fn get_block(&self, hash: &str) -> Result<BlockInfo, BitcoinRpcError> {
         self.call("getblock", json!([hash, 1])).await
     }
 
+    /// Call `addnode <socket> add`.
     pub async fn add_node(&self, socket: &str) -> Result<(), BitcoinRpcError> {
         self.call_value("addnode", json!([socket, "add"])).await?;
         Ok(())
     }
 
+    /// Call `sendtoaddress` and return the transaction id.
     pub async fn send_to_address(
         &self,
         address: &str,
@@ -291,6 +345,7 @@ impl BitcoinRpcClient {
             .await
     }
 
+    /// Call `sendmany` and return the transaction id.
     pub async fn send_many(
         &self,
         amounts: &std::collections::HashMap<String, f64>,
@@ -298,6 +353,7 @@ impl BitcoinRpcClient {
         self.call("sendmany", json!(["", amounts])).await
     }
 
+    /// Call a JSON-RPC method and deserialize the `result` field.
     pub async fn call<T>(&self, method: &str, params: Value) -> Result<T, BitcoinRpcError>
     where
         T: DeserializeOwned,
@@ -310,6 +366,7 @@ impl BitcoinRpcClient {
         })
     }
 
+    /// Call a JSON-RPC method and return the raw JSON `result` field.
     pub async fn call_value(&self, method: &str, params: Value) -> Result<Value, BitcoinRpcError> {
         let response = self
             .client
@@ -363,100 +420,153 @@ impl BitcoinRpcClient {
     }
 }
 
+/// Subset of Bitcoin Core `getblockchaininfo` used by this crate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlockchainInfo {
+    /// Chain name, expected to be `regtest`.
     pub chain: String,
+    /// Current validated block height.
     pub blocks: u64,
+    /// Current header height.
     pub headers: u64,
+    /// Best block hash.
     pub bestblockhash: String,
 }
 
+/// Subset of Bitcoin Core `getblock` response used by this crate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlockInfo {
+    /// Block hash.
     pub hash: String,
+    /// Confirmation count when known.
     pub confirmations: Option<u64>,
+    /// Block height when known.
     pub height: Option<u64>,
+    /// Transaction ids included in the block.
     pub tx: Vec<String>,
 }
 
+/// Response from Bitcoin Core `createwallet`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CreateWallet {
+    /// Created wallet name.
     pub name: String,
+    /// Optional warning text returned by Bitcoin Core.
     #[serde(default)]
     pub warning: String,
 }
 
+/// Response from Bitcoin Core `loadwallet`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LoadWallet {
+    /// Loaded wallet name.
     pub name: String,
+    /// Optional warning text returned by Bitcoin Core.
     #[serde(default)]
     pub warning: String,
 }
 
+/// Error returned by the Bitcoin Core JSON-RPC client.
 #[derive(Debug, Error)]
 pub enum BitcoinRpcError {
+    /// The HTTP request failed before a response was received.
     #[error("Bitcoin Core RPC request failed for method {method}")]
     Request {
+        /// RPC method name.
         method: String,
+        /// Underlying HTTP client error.
         source: reqwest::Error,
     },
 
+    /// The response body could not be read.
     #[error("failed to read Bitcoin Core RPC response body for method {method}")]
     ReadBody {
+        /// RPC method name.
         method: String,
+        /// Underlying HTTP client error.
         source: reqwest::Error,
     },
 
+    /// The response body was not a valid Bitcoin Core JSON-RPC response.
     #[error("failed to decode Bitcoin Core RPC response for method {method}: {body}")]
     Decode {
+        /// RPC method name.
         method: String,
+        /// Raw response body.
         body: String,
+        /// JSON decoding error.
         source: serde_json::Error,
     },
 
+    /// The JSON-RPC `result` field could not be decoded into the requested type.
     #[error("failed to decode Bitcoin Core RPC result for method {method}")]
     DecodeResult {
+        /// RPC method name.
         method: String,
+        /// JSON decoding error.
         source: serde_json::Error,
     },
 
+    /// Bitcoin Core returned a non-success HTTP status.
     #[error("Bitcoin Core RPC method {method} returned HTTP status {status}")]
-    HttpStatus { method: String, status: u16 },
+    HttpStatus {
+        /// RPC method name.
+        method: String,
+        /// HTTP status code.
+        status: u16,
+    },
 
+    /// Bitcoin Core returned a JSON-RPC error object.
     #[error("Bitcoin Core RPC method {method} failed with code {code}: {message}")]
     Rpc {
+        /// RPC method name.
         method: String,
+        /// JSON-RPC error code.
         code: i64,
+        /// JSON-RPC error message.
         message: String,
     },
 }
 
+/// Error returned while spawning or preparing Bitcoin Core.
 #[derive(Debug, Error)]
 pub enum BitcoinCoreError {
+    /// Docker operation failed.
     #[error(transparent)]
     Docker(#[from] DockerError),
 
+    /// Docker did not publish an expected port.
     #[error("Docker container {container_id} did not publish expected port {container_port}")]
     MissingHostPort {
+        /// Docker container id.
         container_id: String,
+        /// Expected container port.
         container_port: u16,
     },
 
+    /// Bitcoin Core RPC did not become ready before timeout.
     #[error(
         "Bitcoin Core did not become ready after {attempts} attempts; last error: {last_error:?}"
     )]
     ReadyTimeout {
+        /// Number of readiness attempts.
         attempts: usize,
+        /// Last RPC error seen while waiting.
         last_error: Option<String>,
     },
 
+    /// Bitcoin Core RPC failed.
     #[error(transparent)]
     BitcoinRpc(#[from] BitcoinRpcError),
 
+    /// Container startup failed; logs are included when available.
     #[error("Bitcoin Core startup failed for container {container_id}; logs: {logs:?}")]
     Startup {
+        /// Docker container id.
         container_id: String,
+        /// Tail of container logs when available.
         logs: Option<String>,
+        /// Underlying startup failure.
         source: Box<BitcoinCoreError>,
     },
 }
@@ -481,11 +591,13 @@ struct JsonRpcErrorObject {
     message: String,
 }
 
+/// Build the value for Bitcoin Core's `-rpcauth` flag.
 pub fn bitcoin_core_rpcauth(user: &str, password: &str, salt: &str) -> String {
     let hmac = bitcoin_core_auth_hmac(password, salt);
     format!("{user}:{salt}${hmac}")
 }
 
+/// Compute Bitcoin Core's HMAC-SHA256 `rpcauth` digest.
 pub fn bitcoin_core_auth_hmac(password: &str, salt: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(salt.as_bytes()).expect("HMAC accepts any key length");
     mac.update(password.as_bytes());

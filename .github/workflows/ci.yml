@@ -18,6 +18,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
       - run: cargo test
       - run: docker version
       - run: RUN_DOCKER_TESTS=1 cargo test --test docker_smoke -- --nocapture

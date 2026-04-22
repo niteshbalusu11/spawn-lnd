@@ -14,7 +14,7 @@ use thiserror::Error;
 use tokio::time::{Duration, sleep};
 
 use crate::{
-    BitcoinCore, DEFAULT_LND_IMAGE,
+    BitcoinCore, DEFAULT_LND_IMAGE, RetryPolicy,
     bitcoin::BITCOIND_RPC_PORT,
     docker::{
         ContainerRole, ContainerSpec, DockerClient, DockerError, SpawnedContainer,
@@ -22,27 +22,42 @@ use crate::{
     },
 };
 
+/// LND gRPC port exposed inside the Docker container.
 pub const LND_GRPC_PORT: u16 = 10009;
+/// LND P2P port exposed inside the Docker container.
 pub const LND_P2P_PORT: u16 = 9735;
+/// Path to the TLS certificate inside the LND container.
 pub const LND_TLS_CERT_PATH: &str = "/root/.lnd/tls.cert";
+/// Path to the admin macaroon inside the LND container.
 pub const LND_ADMIN_MACAROON_PATH: &str = "/root/.lnd/data/chain/bitcoin/regtest/admin.macaroon";
+/// Fixed wallet password used for spawned regtest LND nodes.
 pub const LND_WALLET_PASSWORD: &[u8] = b"password";
+/// Static regtest address used for internal block generation.
 pub const DEFAULT_GENERATE_ADDRESS: &str = "2N8hwP1WmJrFF5QWABn38y63uYLhnJYJYTF";
 
 const READY_RETRY_ATTEMPTS: usize = 500;
 const READY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_UTXO_CONFIRMATIONS: i32 = i32::MAX;
 
+/// Configuration for one spawned LND node.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LndConfig {
+    /// Cluster identifier used in container names and labels.
     pub cluster_id: String,
+    /// LND alias.
     pub alias: String,
+    /// Zero-based node index in spawn order.
     pub node_index: usize,
+    /// Docker image used for this LND container.
     pub image: String,
+    /// Extra command-line flags appended to the LND command.
     pub extra_args: Vec<String>,
+    /// Retry policy used while waiting for wallet init and chain sync.
+    pub startup_retry: RetryPolicy,
 }
 
 impl LndConfig {
+    /// Create an LND config using the default pinned image.
     pub fn new(cluster_id: impl Into<String>, alias: impl Into<String>, node_index: usize) -> Self {
         Self {
             cluster_id: cluster_id.into(),
@@ -50,19 +65,23 @@ impl LndConfig {
             node_index,
             image: DEFAULT_LND_IMAGE.to_string(),
             extra_args: Vec::new(),
+            startup_retry: RetryPolicy::default(),
         }
     }
 
+    /// Override the LND Docker image.
     pub fn image(mut self, image: impl Into<String>) -> Self {
         self.image = image.into();
         self
     }
 
+    /// Append one extra LND command-line argument.
     pub fn extra_arg(mut self, arg: impl Into<String>) -> Self {
         self.extra_args.push(arg.into());
         self
     }
 
+    /// Append multiple extra LND command-line arguments.
     pub fn extra_args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -71,20 +90,35 @@ impl LndConfig {
         self.extra_args.extend(args.into_iter().map(Into::into));
         self
     }
+
+    /// Override the startup retry policy.
+    pub fn startup_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.startup_retry = policy;
+        self
+    }
 }
 
+/// A running LND container and authenticated connection material.
 #[derive(Clone, Debug)]
 pub struct LndDaemon {
+    /// LND alias.
     pub alias: String,
+    /// Docker container metadata.
     pub container: SpawnedContainer,
+    /// Hex-encoded TLS certificate.
     pub cert_hex: String,
+    /// Hex-encoded admin macaroon.
     pub macaroon_hex: String,
+    /// Host gRPC socket, usually `127.0.0.1:<port>`.
     pub rpc_socket: String,
+    /// Host P2P socket, usually `127.0.0.1:<port>`.
     pub p2p_socket: String,
+    /// LND identity public key.
     pub public_key: String,
 }
 
 impl LndDaemon {
+    /// Spawn an LND container, initialize its wallet, and wait for chain sync.
     pub async fn spawn(
         docker: &DockerClient,
         bitcoind: &BitcoinCore,
@@ -109,7 +143,8 @@ impl LndDaemon {
         let container = docker.create_and_start(spec).await?;
         let container_id = container.id.clone();
         let alias = config.alias;
-        let result = Self::initialize_started(docker, container, alias.clone()).await;
+        let result =
+            Self::initialize_started(docker, container, alias.clone(), config.startup_retry).await;
 
         match result {
             Ok(daemon) => Ok(daemon),
@@ -132,6 +167,7 @@ impl LndDaemon {
         docker: &DockerClient,
         container: SpawnedContainer,
         alias: String,
+        startup_retry: RetryPolicy,
     ) -> Result<Self, LndError> {
         let rpc_port =
             container
@@ -148,11 +184,19 @@ impl LndDaemon {
                     container_port: LND_P2P_PORT,
                 })?;
         let rpc_socket = format!("127.0.0.1:{rpc_port}");
-        let cert_bytes = wait_for_file(docker, &container.id, LND_TLS_CERT_PATH).await?;
+        let cert_bytes =
+            wait_for_file(docker, &container.id, LND_TLS_CERT_PATH, &startup_retry).await?;
         let cert_hex = hex::encode(&cert_bytes);
-        let macaroon_hex =
-            init_wallet_or_read_macaroon(docker, &container.id, &cert_bytes, &rpc_socket).await?;
-        let info = wait_for_synced_get_info(&cert_hex, &macaroon_hex, &rpc_socket).await?;
+        let macaroon_hex = init_wallet_or_read_macaroon(
+            docker,
+            &container.id,
+            &cert_bytes,
+            &rpc_socket,
+            &startup_retry,
+        )
+        .await?;
+        let info =
+            wait_for_synced_get_info(&cert_hex, &macaroon_hex, &rpc_socket, &startup_retry).await?;
 
         Ok(Self {
             alias,
@@ -165,6 +209,7 @@ impl LndDaemon {
         })
     }
 
+    /// Build an `lnd_grpc_rust` connection config for this node.
     pub fn node_config(&self) -> LndNodeConfig {
         LndNodeConfig::new(
             self.alias.clone(),
@@ -174,14 +219,25 @@ impl LndDaemon {
         )
     }
 
+    /// Connect to this node using its TLS certificate and admin macaroon.
     pub async fn connect(&self) -> Result<LndClient, LndError> {
         connect_authenticated(&self.cert_hex, &self.macaroon_hex, &self.rpc_socket).await
     }
 
+    /// Wait until `GetInfo` reports `synced_to_chain`.
     pub async fn wait_synced_to_chain(&self) -> Result<GetInfoResponse, LndError> {
-        wait_for_synced_get_info(&self.cert_hex, &self.macaroon_hex, &self.rpc_socket).await
+        self.wait_synced_to_chain_with_policy(&RetryPolicy::default())
+            .await
     }
 
+    pub(crate) async fn wait_synced_to_chain_with_policy(
+        &self,
+        policy: &RetryPolicy,
+    ) -> Result<GetInfoResponse, LndError> {
+        wait_for_synced_get_info(&self.cert_hex, &self.macaroon_hex, &self.rpc_socket, policy).await
+    }
+
+    /// Generate a new LND wallet address.
     pub async fn new_address(&self) -> Result<String, LndError> {
         let mut client = self.connect().await?;
         let response = client
@@ -197,6 +253,7 @@ impl LndDaemon {
         Ok(response.address)
     }
 
+    /// Connect this LND node to a peer by public key and host socket.
     pub async fn connect_peer(
         &self,
         public_key: impl Into<String>,
@@ -250,6 +307,7 @@ impl LndDaemon {
         })
     }
 
+    /// Return LND wallet balance with the given minimum confirmations.
     pub async fn wallet_balance(&self, min_confs: i32) -> Result<WalletBalanceResponse, LndError> {
         let mut client = self.connect().await?;
         let response = client
@@ -265,6 +323,7 @@ impl LndDaemon {
         Ok(response)
     }
 
+    /// Return wallet UTXOs matching the confirmation range.
     pub async fn list_unspent(
         &self,
         min_confs: i32,
@@ -285,6 +344,7 @@ impl LndDaemon {
         Ok(response.utxos)
     }
 
+    /// Wait until confirmed wallet balance is at least `minimum_sat`.
     pub async fn wait_for_spendable_balance(
         &self,
         minimum_sat: i64,
@@ -314,6 +374,7 @@ impl LndDaemon {
         })
     }
 
+    /// Wait until spendable UTXOs total at least `minimum_sat`.
     pub async fn wait_for_spendable_utxos(&self, minimum_sat: i64) -> Result<Vec<Utxo>, LndError> {
         let mut last_error = None;
 
@@ -340,12 +401,12 @@ impl LndDaemon {
         })
     }
 
+    /// Open a public channel synchronously through LND.
     pub async fn open_channel_sync(
         &self,
         remote_public_key: &str,
         local_funding_amount_sat: i64,
         push_sat: i64,
-        private: bool,
     ) -> Result<ChannelPoint, LndError> {
         let mut client = self.connect().await?;
         let remote_public_key =
@@ -360,7 +421,7 @@ impl LndDaemon {
                 local_funding_amount: local_funding_amount_sat,
                 push_sat,
                 target_conf: 1,
-                private,
+                private: false,
                 min_confs: 1,
                 spend_unconfirmed: false,
                 ..Default::default()
@@ -372,6 +433,7 @@ impl LndDaemon {
         Ok(response)
     }
 
+    /// Return LND pending channel state.
     pub async fn pending_channels(&self) -> Result<PendingChannelsResponse, LndError> {
         let mut client = self.connect().await?;
         let response = client
@@ -386,6 +448,7 @@ impl LndDaemon {
         Ok(response)
     }
 
+    /// List channels, optionally filtered by remote public key.
     pub async fn list_channels(
         &self,
         remote_public_key: Option<&str>,
@@ -417,6 +480,7 @@ impl LndDaemon {
         Ok(response.channels)
     }
 
+    /// Wait until LND reports a pending channel with the given peer and point.
     pub async fn wait_for_pending_channel(
         &self,
         remote_public_key: &str,
@@ -450,6 +514,7 @@ impl LndDaemon {
         })
     }
 
+    /// Wait until LND reports an active channel with the given peer and point.
     pub async fn wait_for_active_channel(
         &self,
         remote_public_key: &str,
@@ -488,7 +553,9 @@ impl LndDaemon {
     }
 }
 
+/// Error returned by LND lifecycle and RPC helpers.
 #[derive(Debug, Error)]
+#[allow(missing_docs)]
 pub enum LndError {
     #[error(transparent)]
     Docker(#[from] DockerError),
@@ -659,6 +726,8 @@ fn lnd_args(bitcoind_ip: &str, bitcoind: &BitcoinCore) -> Vec<String> {
         format!("--bitcoind.rpchost={bitcoind_ip}:{BITCOIND_RPC_PORT}"),
         format!("--bitcoind.rpcuser={}", bitcoind.auth.user),
         format!("--bitcoind.rpcpass={}", bitcoind.auth.password),
+        "--accept-keysend".to_string(),
+        "--allow-circular-route".to_string(),
         "--debuglevel=info".to_string(),
         "--noseedbackup".to_string(),
         "--listen=0.0.0.0:9735".to_string(),
@@ -708,15 +777,16 @@ async fn wait_for_file(
     docker: &DockerClient,
     container_id: &str,
     path: &str,
+    policy: &RetryPolicy,
 ) -> Result<Vec<u8>, LndError> {
     let mut last_error = None;
 
-    for _ in 0..READY_RETRY_ATTEMPTS {
+    for _ in 0..policy.attempts {
         match docker.copy_file_from_container(container_id, path).await {
             Ok(file) => return Ok(file),
             Err(error) => {
                 last_error = Some(error.to_string());
-                sleep(READY_RETRY_INTERVAL).await;
+                sleep(policy.interval()).await;
             }
         }
     }
@@ -724,7 +794,7 @@ async fn wait_for_file(
     Err(LndError::FileTimeout {
         container_id: container_id.to_string(),
         path: path.to_string(),
-        attempts: READY_RETRY_ATTEMPTS,
+        attempts: policy.attempts,
         last_error,
     })
 }
@@ -734,10 +804,11 @@ async fn init_wallet_or_read_macaroon(
     container_id: &str,
     cert_bytes: &[u8],
     socket: &str,
+    policy: &RetryPolicy,
 ) -> Result<String, LndError> {
     let mut last_error = None;
 
-    for _ in 0..READY_RETRY_ATTEMPTS {
+    for _ in 0..policy.attempts {
         let init_error = match init_wallet_once(cert_bytes, socket).await {
             Ok(macaroon) if !macaroon.is_empty() => return Ok(macaroon),
             Ok(_) => Some("InitWallet returned an empty admin macaroon".to_string()),
@@ -763,11 +834,11 @@ async fn init_wallet_or_read_macaroon(
             }
         }
 
-        sleep(READY_RETRY_INTERVAL).await;
+        sleep(policy.interval()).await;
     }
 
     Err(LndError::WalletInitTimeout {
-        attempts: READY_RETRY_ATTEMPTS,
+        attempts: policy.attempts,
         last_error,
     })
 }
@@ -819,10 +890,11 @@ async fn wait_for_synced_get_info(
     cert_hex: &str,
     macaroon_hex: &str,
     socket: &str,
+    policy: &RetryPolicy,
 ) -> Result<GetInfoResponse, LndError> {
     let mut last_error = None;
 
-    for _ in 0..READY_RETRY_ATTEMPTS {
+    for _ in 0..policy.attempts {
         match get_synced_info_once(cert_hex, macaroon_hex, socket).await {
             Ok(info) if info.synced_to_chain => return Ok(info),
             Ok(info) => {
@@ -834,11 +906,11 @@ async fn wait_for_synced_get_info(
             Err(error) => last_error = Some(error.to_string()),
         }
 
-        sleep(READY_RETRY_INTERVAL).await;
+        sleep(policy.interval()).await;
     }
 
     Err(LndError::ReadyTimeout {
-        attempts: READY_RETRY_ATTEMPTS,
+        attempts: policy.attempts,
         last_error,
     })
 }
@@ -939,6 +1011,8 @@ mod tests {
         assert!(args.contains(&"--bitcoind.rpchost=172.17.0.2:18443".to_string()));
         assert!(args.contains(&"--bitcoind.rpcuser=bitcoinrpc".to_string()));
         assert!(args.contains(&"--bitcoind.rpcpass=password".to_string()));
+        assert!(args.contains(&"--accept-keysend".to_string()));
+        assert!(args.contains(&"--allow-circular-route".to_string()));
         assert!(args.contains(&"--debuglevel=info".to_string()));
         assert!(args.contains(&"--noseedbackup".to_string()));
     }

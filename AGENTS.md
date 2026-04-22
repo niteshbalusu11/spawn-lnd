@@ -75,6 +75,9 @@ docker ps -a --filter label=spawn-lnd=true
 - Startup failures capture a bounded Docker log tail before cleanup when a
   container was created.
 - `SPAWN_LND_KEEP_CONTAINERS=1` disables automatic cleanup for debugging.
+- Startup retry policy is configurable through `RetryPolicy`, builder methods,
+  `SPAWN_LND_STARTUP_RETRY_ATTEMPTS`, and
+  `SPAWN_LND_STARTUP_RETRY_INTERVAL_MS`.
 - LND wallet init may succeed before the `WalletUnlocker` response is usable;
   fallback to `/root/.lnd/data/chain/bitcoin/regtest/admin.macaroon`.
 - Do not leave Docker containers behind after tests or failed startup.

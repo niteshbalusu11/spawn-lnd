@@ -1,8 +1,41 @@
-//! Test utilities for spawning Docker-backed LND and Bitcoin Core regtest
-//! clusters.
+#![warn(missing_docs)]
+
+//! Docker-backed LND and Bitcoin Core regtest clusters for Rust integration
+//! tests.
 //!
 //! The crate is library-first: integration tests should use the public API from
 //! here, while binaries and examples stay thin wrappers over the library.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use spawn_lnd::SpawnLnd;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut cluster = SpawnLnd::builder()
+//!     .nodes(["alice", "bob"])
+//!     .spawn()
+//!     .await?;
+//!
+//! cluster.fund_nodes(["alice", "bob"]).await?;
+//! let channel = cluster.open_channel("alice", "bob").await?;
+//! let mut clients = cluster.connect_nodes().await?;
+//!
+//! let alice_info = clients
+//!     .get_mut("alice")
+//!     .expect("alice client")
+//!     .lightning()
+//!     .get_info(lnd_grpc_rust::lnrpc::GetInfoRequest {})
+//!     .await?
+//!     .into_inner();
+//!
+//! assert!(alice_info.synced_to_chain);
+//! assert!(channel.from_channel.active);
+//!
+//! cluster.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
 
 mod bitcoin;
 mod cluster;
@@ -23,8 +56,10 @@ pub use cluster::{
 };
 pub use config::{
     ConfigError, DEFAULT_BITCOIND_IMAGE, DEFAULT_LND_IMAGE, DEFAULT_NODE_ALIAS,
-    DEFAULT_NODES_PER_BITCOIND, ENV_BITCOIND_IMAGE, ENV_KEEP_CONTAINERS, ENV_LND_IMAGE,
-    ENV_NODES_PER_BITCOIND, NodeConfig, SpawnLnd, SpawnLndBuilder, SpawnLndConfig,
+    DEFAULT_NODES_PER_BITCOIND, DEFAULT_STARTUP_RETRY_ATTEMPTS, DEFAULT_STARTUP_RETRY_INTERVAL_MS,
+    ENV_BITCOIND_IMAGE, ENV_KEEP_CONTAINERS, ENV_LND_IMAGE, ENV_NODES_PER_BITCOIND,
+    ENV_STARTUP_RETRY_ATTEMPTS, ENV_STARTUP_RETRY_INTERVAL_MS, NodeConfig, RetryPolicy, SpawnLnd,
+    SpawnLndBuilder, SpawnLndConfig,
 };
 pub use docker::{
     CleanupFailure, CleanupReport, ContainerRole, ContainerSpec, DockerClient, DockerError,
@@ -46,6 +81,6 @@ mod tests {
 
     #[test]
     fn exposes_crate_version() {
-        assert!(!VERSION.is_empty());
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
     }
 }
