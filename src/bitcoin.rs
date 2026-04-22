@@ -17,8 +17,6 @@ use crate::{
 pub const DEFAULT_BITCOIN_RPC_USER: &str = "bitcoinrpc";
 pub const BITCOIND_RPC_PORT: u16 = 18443;
 pub const BITCOIND_P2P_PORT: u16 = 18444;
-pub const BITCOIND_ZMQ_BLOCK_PORT: u16 = 28332;
-pub const BITCOIND_ZMQ_TX_PORT: u16 = 28333;
 
 const READY_RETRY_ATTEMPTS: usize = 100;
 const READY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -54,8 +52,6 @@ pub struct BitcoinCore {
     pub rpc: BitcoinRpcClient,
     pub rpc_socket: String,
     pub p2p_socket: String,
-    pub zmq_block_socket: String,
-    pub zmq_tx_socket: String,
 }
 
 impl BitcoinCore {
@@ -94,26 +90,11 @@ impl BitcoinCore {
                 container_port: BITCOIND_P2P_PORT,
             }
         })?;
-        let zmq_block_port = container
-            .host_port(BITCOIND_ZMQ_BLOCK_PORT)
-            .ok_or_else(|| BitcoinCoreError::MissingHostPort {
-                container_id: container.id.clone(),
-                container_port: BITCOIND_ZMQ_BLOCK_PORT,
-            })?;
-        let zmq_tx_port = container.host_port(BITCOIND_ZMQ_TX_PORT).ok_or_else(|| {
-            BitcoinCoreError::MissingHostPort {
-                container_id: container.id.clone(),
-                container_port: BITCOIND_ZMQ_TX_PORT,
-            }
-        })?;
-
         let rpc = BitcoinRpcClient::new("127.0.0.1", rpc_port, &auth.user, &auth.password);
 
         Ok(Self {
             rpc_socket: format!("127.0.0.1:{rpc_port}"),
             p2p_socket: format!("127.0.0.1:{p2p_port}"),
-            zmq_block_socket: format!("tcp://127.0.0.1:{zmq_block_port}"),
-            zmq_tx_socket: format!("tcp://127.0.0.1:{zmq_tx_port}"),
             container,
             auth,
             rpc,
@@ -398,37 +379,31 @@ fn bitcoind_container_spec(config: &BitcoinCoreConfig, auth: &BitcoinRpcAuth) ->
     ContainerSpec::new(name, config.image.clone())
         .cmd(bitcoind_args(auth))
         .labels(labels)
-        .expose_ports([
-            BITCOIND_RPC_PORT,
-            BITCOIND_P2P_PORT,
-            BITCOIND_ZMQ_BLOCK_PORT,
-            BITCOIND_ZMQ_TX_PORT,
-        ])
+        .expose_ports([BITCOIND_RPC_PORT, BITCOIND_P2P_PORT])
 }
 
 fn bitcoind_args(auth: &BitcoinRpcAuth) -> Vec<String> {
     vec![
-        "-disablewallet".to_string(),
-        "-listen=1".to_string(),
-        "-persistmempool=false".to_string(),
-        "-printtoconsole".to_string(),
         "-regtest".to_string(),
-        "-rpcallowip=0.0.0.0/0".to_string(),
-        format!("-rpcauth={}", auth.rpcauth),
+        "-printtoconsole".to_string(),
         "-rpcbind=0.0.0.0".to_string(),
+        "-rpcallowip=0.0.0.0/0".to_string(),
+        "-fallbackfee=0.00001".to_string(),
         "-server".to_string(),
         "-txindex".to_string(),
-        format!("-zmqpubrawblock=tcp://*:{}", BITCOIND_ZMQ_BLOCK_PORT),
-        format!("-zmqpubrawtx=tcp://*:{}", BITCOIND_ZMQ_TX_PORT),
+        "-blockfilterindex".to_string(),
+        "-coinstatsindex".to_string(),
+        format!("-rpcuser={}", auth.user),
+        format!("-rpcpassword={}", auth.password),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BITCOIND_P2P_PORT, BITCOIND_RPC_PORT, BITCOIND_ZMQ_BLOCK_PORT, BITCOIND_ZMQ_TX_PORT,
-        BitcoinCoreConfig, BitcoinRpcAuth, BitcoinRpcClient, DEFAULT_BITCOIN_RPC_USER,
-        bitcoin_core_auth_hmac, bitcoin_core_rpcauth, bitcoind_args, bitcoind_container_spec,
+        BITCOIND_P2P_PORT, BITCOIND_RPC_PORT, BitcoinCoreConfig, BitcoinRpcAuth, BitcoinRpcClient,
+        DEFAULT_BITCOIN_RPC_USER, bitcoin_core_auth_hmac, bitcoin_core_rpcauth, bitcoind_args,
+        bitcoind_container_spec,
     };
     use crate::DEFAULT_BITCOIND_IMAGE;
 
@@ -485,15 +460,17 @@ mod tests {
 
         let args = bitcoind_args(&auth);
 
-        assert!(args.contains(&"-disablewallet".to_string()));
         assert!(args.contains(&"-regtest".to_string()));
+        assert!(args.contains(&"-printtoconsole".to_string()));
+        assert!(args.contains(&"-rpcbind=0.0.0.0".to_string()));
+        assert!(args.contains(&"-rpcallowip=0.0.0.0/0".to_string()));
         assert!(args.contains(&"-server".to_string()));
         assert!(args.contains(&"-txindex".to_string()));
-        assert!(args.contains(&format!("-rpcauth={}", auth.rpcauth)));
-        assert!(args.contains(&format!(
-            "-zmqpubrawblock=tcp://*:{BITCOIND_ZMQ_BLOCK_PORT}"
-        )));
-        assert!(args.contains(&format!("-zmqpubrawtx=tcp://*:{BITCOIND_ZMQ_TX_PORT}")));
+        assert!(args.contains(&"-fallbackfee=0.00001".to_string()));
+        assert!(args.contains(&"-blockfilterindex".to_string()));
+        assert!(args.contains(&"-coinstatsindex".to_string()));
+        assert!(args.contains(&format!("-rpcuser={}", auth.user)));
+        assert!(args.contains(&format!("-rpcpassword={}", auth.password)));
     }
 
     #[test]
@@ -511,7 +488,5 @@ mod tests {
         assert_eq!(spec.image, DEFAULT_BITCOIND_IMAGE);
         assert!(spec.exposed_ports.contains(&BITCOIND_RPC_PORT));
         assert!(spec.exposed_ports.contains(&BITCOIND_P2P_PORT));
-        assert!(spec.exposed_ports.contains(&BITCOIND_ZMQ_BLOCK_PORT));
-        assert!(spec.exposed_ports.contains(&BITCOIND_ZMQ_TX_PORT));
     }
 }

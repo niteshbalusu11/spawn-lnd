@@ -11,15 +11,17 @@ async fn bitcoind_smoke_spawns_and_answers_rpc() {
     let docker = DockerClient::connect().await.expect("connect to Docker");
     let cluster_id = format!("bitcoind-smoke-{}", Uuid::new_v4());
 
-    let result = BitcoinCore::spawn(&docker, BitcoinCoreConfig::new(cluster_id.clone(), 0)).await;
+    let result = async {
+        let bitcoind =
+            BitcoinCore::spawn(&docker, BitcoinCoreConfig::new(cluster_id.clone(), 0)).await?;
+        let info = bitcoind.rpc.get_blockchain_info().await?;
+
+        Ok::<_, Box<dyn std::error::Error>>(info)
+    }
+    .await;
     let cleanup = docker.cleanup_cluster(&cluster_id).await;
 
-    let bitcoind = result.expect("spawn Bitcoin Core");
-    let info = bitcoind
-        .rpc
-        .get_blockchain_info()
-        .await
-        .expect("get blockchain info");
+    let info = result.expect("spawn Bitcoin Core and query RPC");
 
     assert_eq!(info.chain, "regtest");
 

@@ -2091,6 +2091,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "hyper",
  "lnd_grpc_rust",
  "rand 0.9.4",
  "reqwest",

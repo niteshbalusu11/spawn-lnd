@@ -123,7 +123,7 @@ Primary public types:
 
 ### `src/bitcoin.rs`
 
-- Generate `rpcauth` credentials compatible with Bitcoin Core.
+- Generate RPC credentials compatible with Bitcoin Core.
 - Spawn Bitcoin Core with regtest arguments:
   - `-regtest`
   - `-server`
@@ -131,8 +131,11 @@ Primary public types:
   - `-disablewallet`
   - `-rpcbind=0.0.0.0`
   - `-rpcallowip=0.0.0.0/0`
-  - `-rpcauth=<user>:<salt>$<hmac>`
-  - ZMQ raw block and raw tx endpoints.
+  - `-rpcuser=<user>`
+  - `-rpcpassword=<password>`
+  - `-fallbackfee=0.00001`
+  - `-blockfilterindex`
+  - `-coinstatsindex`
 - Implement a small JSON-RPC client using `reqwest`.
 - Add helpers:
   - `get_blockchain_info`
@@ -212,7 +215,7 @@ Primary public types:
 
 ### Milestone 3: Bitcoin Core
 
-- [x] Implement Bitcoin Core RPC auth generation.
+- [x] Implement Bitcoin Core RPC credential generation.
 - [x] Implement JSON-RPC client.
 - [x] Spawn Bitcoin Core regtest container.
 - [x] Wait for `getblockchaininfo`.
@@ -222,14 +225,14 @@ Primary public types:
 
 ### Milestone 4: Single LND Node
 
-- [ ] Spawn LND connected to Bitcoin Core.
-- [ ] Copy TLS cert from the container.
-- [ ] Add unauthenticated WalletUnlocker connection.
-- [ ] Generate seed and initialize wallet.
-- [ ] Capture admin macaroon as hex.
-- [ ] Wait for authenticated `GetInfo`.
-- [ ] Return `LndNodeConfig`.
-- [ ] Add integration test that connects through `lnd-grpc-rust`.
+- [x] Spawn LND connected to Bitcoin Core.
+- [x] Copy TLS cert from the container.
+- [x] Add unauthenticated WalletUnlocker connection.
+- [x] Generate seed and initialize wallet.
+- [x] Capture admin macaroon as hex.
+- [x] Wait for authenticated `GetInfo` with `synced_to_chain=true`.
+- [x] Return `LndNodeConfig`.
+- [x] Add integration test that connects through `lnd-grpc-rust`.
 
 ### Milestone 5: Multi-Node Cluster
 
