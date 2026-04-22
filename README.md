@@ -24,10 +24,11 @@ Implemented:
 - Lightning peer connection between aliases.
 - Wallet funding by mining regtest coinbase blocks to an LND wallet address and
   waiting for spendable UTXOs.
+- Channel opening helpers that wait for pending state, mine confirmations, and
+  wait for both sides to report the channel active.
 
 In progress:
 
-- Channel setup helpers.
 - Minimal CLI.
 
 ## Default Images
@@ -51,6 +52,8 @@ async fn spawn_two_lnds() -> Result<(), Box<dyn std::error::Error>> {
         cluster.connect_peer("alice", "bob").await?;
         let funding = cluster.fund_node("alice").await?;
         assert!(funding.spendable_utxo_total_sat > 0);
+        let channel = cluster.open_channel("alice", "bob").await?;
+        assert!(channel.from_channel.active);
 
         let mut clients = cluster.connect_nodes().await?;
         let info = clients
@@ -86,6 +89,7 @@ RUN_DOCKER_TESTS=1 cargo test --test docker_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test bitcoind_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test cluster_smoke -- --nocapture
+RUN_DOCKER_TESTS=1 cargo test --test channel_smoke -- --nocapture
 ```
 
 Check for leftover managed containers:

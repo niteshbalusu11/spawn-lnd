@@ -249,11 +249,11 @@ Primary public types:
 
 ### Milestone 6: Channel Helpers
 
-- [ ] Implement `open_channel`.
-- [ ] Wait for pending channel.
-- [ ] Mine confirmation blocks.
-- [ ] Wait for active channel.
-- [ ] Add two-node channel integration test.
+- [x] Implement `open_channel`.
+- [x] Wait for pending channel.
+- [x] Mine confirmation blocks.
+- [x] Wait for active channel.
+- [x] Add two-node channel integration test.
 
 ### Milestone 7: Reliability And CI
 

@@ -16,6 +16,7 @@ pub use bitcoin::{
     DEFAULT_BITCOIN_RPC_USER, bitcoin_core_auth_hmac, bitcoin_core_rpcauth,
 };
 pub use cluster::{
+    ChannelReport, DEFAULT_CHANNEL_CAPACITY_SAT, DEFAULT_CHANNEL_CONFIRMATION_BLOCKS,
     DEFAULT_FUNDING_MATURITY_BLOCKS, FundingReport, PeerConnection, SpawnError, SpawnedCluster,
     SpawnedNode,
 };

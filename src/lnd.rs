@@ -2,10 +2,11 @@ use hyper::Uri;
 use lnd_grpc_rust::{
     LndClient, LndNodeConfig, MyChannel,
     lnrpc::{
-        AddressType, ConnectPeerRequest, ConnectPeerResponse, GenSeedRequest, GetInfoRequest,
-        GetInfoResponse, InitWalletRequest, LightningAddress, ListUnspentRequest,
-        NewAddressRequest, Utxo, WalletBalanceRequest, WalletBalanceResponse,
-        wallet_unlocker_client::WalletUnlockerClient,
+        AddressType, Channel, ChannelPoint, ConnectPeerRequest, ConnectPeerResponse,
+        GenSeedRequest, GetInfoRequest, GetInfoResponse, InitWalletRequest, LightningAddress,
+        ListChannelsRequest, ListUnspentRequest, NewAddressRequest, OpenChannelRequest,
+        PendingChannelsRequest, PendingChannelsResponse, Utxo, WalletBalanceRequest,
+        WalletBalanceResponse, wallet_unlocker_client::WalletUnlockerClient,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -290,6 +291,153 @@ impl LndDaemon {
             last_error,
         })
     }
+
+    pub async fn open_channel_sync(
+        &self,
+        remote_public_key: &str,
+        local_funding_amount_sat: i64,
+        push_sat: i64,
+        private: bool,
+    ) -> Result<ChannelPoint, LndError> {
+        let mut client = self.connect().await?;
+        let remote_public_key =
+            hex::decode(remote_public_key).map_err(|error| LndError::InvalidPublicKey {
+                public_key: remote_public_key.to_string(),
+                message: error.to_string(),
+            })?;
+        let response = client
+            .lightning()
+            .open_channel_sync(OpenChannelRequest {
+                node_pubkey: remote_public_key,
+                local_funding_amount: local_funding_amount_sat,
+                push_sat,
+                target_conf: 1,
+                private,
+                min_confs: 1,
+                spend_unconfirmed: false,
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "OpenChannelSync", error))?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    pub async fn pending_channels(&self) -> Result<PendingChannelsResponse, LndError> {
+        let mut client = self.connect().await?;
+        let response = client
+            .lightning()
+            .pending_channels(PendingChannelsRequest {
+                include_raw_tx: false,
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "PendingChannels", error))?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    pub async fn list_channels(
+        &self,
+        remote_public_key: Option<&str>,
+    ) -> Result<Vec<Channel>, LndError> {
+        let mut client = self.connect().await?;
+        let peer = match remote_public_key {
+            Some(public_key) => {
+                hex::decode(public_key).map_err(|error| LndError::InvalidPublicKey {
+                    public_key: public_key.to_string(),
+                    message: error.to_string(),
+                })?
+            }
+            None => Vec::new(),
+        };
+        let response = client
+            .lightning()
+            .list_channels(ListChannelsRequest {
+                active_only: false,
+                inactive_only: false,
+                public_only: false,
+                private_only: false,
+                peer,
+                peer_alias_lookup: true,
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "ListChannels", error))?
+            .into_inner();
+
+        Ok(response.channels)
+    }
+
+    pub async fn wait_for_pending_channel(
+        &self,
+        remote_public_key: &str,
+        channel_point: &str,
+    ) -> Result<(), LndError> {
+        let mut last_error = None;
+
+        for _ in 0..READY_RETRY_ATTEMPTS {
+            match self.pending_channels().await {
+                Ok(pending) if has_pending_channel(&pending, remote_public_key, channel_point) => {
+                    return Ok(());
+                }
+                Ok(pending) => {
+                    last_error = Some(format!(
+                        "pending channels did not include {channel_point}; count={}",
+                        pending.pending_open_channels.len()
+                    ));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+
+            sleep(READY_RETRY_INTERVAL).await;
+        }
+
+        Err(LndError::PendingChannelTimeout {
+            alias: self.alias.clone(),
+            remote_public_key: remote_public_key.to_string(),
+            channel_point: channel_point.to_string(),
+            attempts: READY_RETRY_ATTEMPTS,
+            last_error,
+        })
+    }
+
+    pub async fn wait_for_active_channel(
+        &self,
+        remote_public_key: &str,
+        channel_point: &str,
+    ) -> Result<Channel, LndError> {
+        let mut last_error = None;
+
+        for _ in 0..READY_RETRY_ATTEMPTS {
+            match self.list_channels(Some(remote_public_key)).await {
+                Ok(channels) => {
+                    if let Some(channel) = channels
+                        .iter()
+                        .find(|channel| channel.channel_point == channel_point && channel.active)
+                    {
+                        return Ok(channel.clone());
+                    }
+
+                    last_error = Some(format!(
+                        "active channels did not include {channel_point}; count={}",
+                        channels.len()
+                    ));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+
+            sleep(READY_RETRY_INTERVAL).await;
+        }
+
+        Err(LndError::ActiveChannelTimeout {
+            alias: self.alias.clone(),
+            remote_public_key: remote_public_key.to_string(),
+            channel_point: channel_point.to_string(),
+            attempts: READY_RETRY_ATTEMPTS,
+            last_error,
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -318,6 +466,9 @@ pub enum LndError {
         method: &'static str,
         message: String,
     },
+
+    #[error("invalid LND public key {public_key}: {message}")]
+    InvalidPublicKey { public_key: String, message: String },
 
     #[error("failed to create unauthenticated LND channel to {socket}: {message}")]
     UnauthenticatedChannel { socket: String, message: String },
@@ -364,6 +515,28 @@ pub enum LndError {
     UtxoTimeout {
         alias: String,
         minimum_sat: i64,
+        attempts: usize,
+        last_error: Option<String>,
+    },
+
+    #[error(
+        "LND node {alias} did not report pending channel {channel_point} with {remote_public_key} after {attempts} attempts; last error: {last_error:?}"
+    )]
+    PendingChannelTimeout {
+        alias: String,
+        remote_public_key: String,
+        channel_point: String,
+        attempts: usize,
+        last_error: Option<String>,
+    },
+
+    #[error(
+        "LND node {alias} did not report active channel {channel_point} with {remote_public_key} after {attempts} attempts; last error: {last_error:?}"
+    )]
+    ActiveChannelTimeout {
+        alias: String,
+        remote_public_key: String,
+        channel_point: String,
         attempts: usize,
         last_error: Option<String>,
     },
@@ -421,6 +594,40 @@ fn lnd_args(bitcoind_ip: &str, bitcoind: &BitcoinCore) -> Vec<String> {
 
 fn utxo_total_sat(utxos: &[Utxo]) -> i64 {
     utxos.iter().map(|utxo| utxo.amount_sat).sum()
+}
+
+pub(crate) fn channel_point_string(channel_point: &ChannelPoint) -> Result<String, LndError> {
+    let funding_txid = match channel_point.funding_txid.as_ref() {
+        Some(lnd_grpc_rust::lnrpc::channel_point::FundingTxid::FundingTxidBytes(bytes)) => {
+            let mut txid = bytes.clone();
+            txid.reverse();
+            hex::encode(txid)
+        }
+        Some(lnd_grpc_rust::lnrpc::channel_point::FundingTxid::FundingTxidStr(txid)) => {
+            txid.clone()
+        }
+        None => {
+            return Err(LndError::Rpc {
+                socket: "<open-channel>".to_string(),
+                method: "OpenChannelSync",
+                message: "response did not include funding txid".to_string(),
+            });
+        }
+    };
+
+    Ok(format!("{}:{}", funding_txid, channel_point.output_index))
+}
+
+fn has_pending_channel(
+    pending: &PendingChannelsResponse,
+    remote_public_key: &str,
+    channel_point: &str,
+) -> bool {
+    pending.pending_open_channels.iter().any(|pending| {
+        pending.channel.as_ref().is_some_and(|channel| {
+            channel.remote_node_pub == remote_public_key && channel.channel_point == channel_point
+        })
+    })
 }
 
 async fn wait_for_file(
@@ -608,7 +815,11 @@ mod tests {
         docker::SpawnedContainer,
     };
 
-    use super::{LND_GRPC_PORT, LND_P2P_PORT, LndConfig, lnd_args, lnd_container_spec};
+    use lnd_grpc_rust::lnrpc::{ChannelPoint, channel_point};
+
+    use super::{
+        LND_GRPC_PORT, LND_P2P_PORT, LndConfig, channel_point_string, lnd_args, lnd_container_spec,
+    };
 
     fn fake_bitcoind() -> BitcoinCore {
         BitcoinCore {
@@ -668,5 +879,35 @@ mod tests {
         assert!(spec.cmd.contains(&"--debuglevel=info".to_string()));
         assert!(spec.exposed_ports.contains(&LND_GRPC_PORT));
         assert!(spec.exposed_ports.contains(&LND_P2P_PORT));
+    }
+
+    #[test]
+    fn formats_channel_point_string() {
+        let channel_point = ChannelPoint {
+            funding_txid: Some(channel_point::FundingTxid::FundingTxidStr(
+                "txid".to_string(),
+            )),
+            output_index: 1,
+        };
+
+        assert_eq!(
+            channel_point_string(&channel_point).expect("channel point"),
+            "txid:1"
+        );
+    }
+
+    #[test]
+    fn formats_channel_point_bytes_as_display_txid() {
+        let channel_point = ChannelPoint {
+            funding_txid: Some(channel_point::FundingTxid::FundingTxidBytes(vec![
+                0x01, 0x02, 0x03, 0x04,
+            ])),
+            output_index: 0,
+        };
+
+        assert_eq!(
+            channel_point_string(&channel_point).expect("channel point"),
+            "04030201:0"
+        );
     }
 }

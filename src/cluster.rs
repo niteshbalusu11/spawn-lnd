@@ -1,16 +1,21 @@
 use std::collections::HashMap;
 
-use lnd_grpc_rust::{LndConnectError, LndNodeClients, LndNodeConfig, lnrpc::ConnectPeerResponse};
+use lnd_grpc_rust::{
+    LndConnectError, LndNodeClients, LndNodeConfig,
+    lnrpc::{Channel, ConnectPeerResponse},
+};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
     BITCOIND_P2P_PORT, BitcoinCore, BitcoinCoreConfig, BitcoinCoreError, BitcoinRpcError,
     CleanupReport, ConfigError, DEFAULT_GENERATE_ADDRESS, DockerClient, DockerError, LND_P2P_PORT,
-    LndConfig, LndDaemon, LndError, NodeConfig, SpawnLndConfig,
+    LndConfig, LndDaemon, LndError, NodeConfig, SpawnLndConfig, lnd::channel_point_string,
 };
 
 pub const DEFAULT_FUNDING_MATURITY_BLOCKS: u64 = 101;
+pub const DEFAULT_CHANNEL_CAPACITY_SAT: i64 = 100_000;
+pub const DEFAULT_CHANNEL_CONFIRMATION_BLOCKS: u64 = 6;
 const DEFAULT_MIN_FUNDING_SAT: i64 = 1;
 
 #[derive(Debug)]
@@ -206,6 +211,91 @@ impl SpawnedCluster {
         })
     }
 
+    pub async fn open_channel(
+        &self,
+        from_alias: &str,
+        to_alias: &str,
+    ) -> Result<ChannelReport, SpawnError> {
+        self.open_channel_with_amount(from_alias, to_alias, DEFAULT_CHANNEL_CAPACITY_SAT)
+            .await
+    }
+
+    pub async fn open_channel_with_amount(
+        &self,
+        from_alias: &str,
+        to_alias: &str,
+        local_funding_amount_sat: i64,
+    ) -> Result<ChannelReport, SpawnError> {
+        let from = self.require_node(from_alias)?;
+        let to = self.require_node(to_alias)?;
+        let bitcoind = &self.bitcoinds[from.chain_group_index];
+
+        self.connect_peer(from_alias, to_alias).await?;
+
+        let channel_point = from
+            .daemon
+            .open_channel_sync(&to.daemon.public_key, local_funding_amount_sat, 0, true)
+            .await
+            .map_err(|source| SpawnError::Lnd {
+                alias: from_alias.to_string(),
+                source,
+            })?;
+        let channel_point =
+            channel_point_string(&channel_point).map_err(|source| SpawnError::Lnd {
+                alias: from_alias.to_string(),
+                source,
+            })?;
+
+        from.daemon
+            .wait_for_pending_channel(&to.daemon.public_key, &channel_point)
+            .await
+            .map_err(|source| SpawnError::Lnd {
+                alias: from_alias.to_string(),
+                source,
+            })?;
+
+        let confirmation_blocks = bitcoind
+            .rpc
+            .generate_to_address(
+                DEFAULT_CHANNEL_CONFIRMATION_BLOCKS,
+                DEFAULT_GENERATE_ADDRESS,
+            )
+            .await
+            .map_err(|source| SpawnError::BitcoinRpc {
+                group_index: from.chain_group_index,
+                source,
+            })?;
+
+        wait_lnd_nodes_synced(&self.nodes, &self.node_order).await?;
+
+        let from_channel = from
+            .daemon
+            .wait_for_active_channel(&to.daemon.public_key, &channel_point)
+            .await
+            .map_err(|source| SpawnError::Lnd {
+                alias: from_alias.to_string(),
+                source,
+            })?;
+        let to_channel = to
+            .daemon
+            .wait_for_active_channel(&from.daemon.public_key, &channel_point)
+            .await
+            .map_err(|source| SpawnError::Lnd {
+                alias: to_alias.to_string(),
+                source,
+            })?;
+
+        Ok(ChannelReport {
+            from_alias: from_alias.to_string(),
+            to_alias: to_alias.to_string(),
+            channel_point,
+            local_funding_amount_sat,
+            confirmation_blocks,
+            from_channel,
+            to_channel,
+        })
+    }
+
     pub async fn shutdown(&mut self) -> Result<CleanupReport, SpawnError> {
         if self.shutdown || self.config.keep_containers {
             self.shutdown = true;
@@ -297,6 +387,17 @@ pub struct FundingReport {
     pub confirmed_balance_sat: i64,
     pub spendable_utxo_count: usize,
     pub spendable_utxo_total_sat: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChannelReport {
+    pub from_alias: String,
+    pub to_alias: String,
+    pub channel_point: String,
+    pub local_funding_amount_sat: i64,
+    pub confirmation_blocks: Vec<String>,
+    pub from_channel: Channel,
+    pub to_channel: Channel,
 }
 
 #[derive(Debug, Error)]

@@ -27,6 +27,7 @@ Bitcoin Core and LND regtest nodes.
 - `tests/bitcoind_smoke.rs`: gated Bitcoin Core smoke test.
 - `tests/lnd_smoke.rs`: gated LND smoke test requiring `synced_to_chain=true`.
 - `tests/cluster_smoke.rs`: gated two-node high-level cluster smoke test.
+- `tests/channel_smoke.rs`: gated channel open/confirm/active smoke test.
 - `docs/todo.md`: engineering plan and remaining milestones.
 
 ## Commands
@@ -44,6 +45,7 @@ Docker-backed tests are gated:
 ```sh
 RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test cluster_smoke -- --nocapture
+RUN_DOCKER_TESTS=1 cargo test --test channel_smoke -- --nocapture
 ```
 
 Cleanup check:
@@ -60,6 +62,9 @@ docker ps -a --filter label=spawn-lnd=true
 - Cluster funding mines one coinbase block to the LND wallet address and
   `DEFAULT_FUNDING_MATURITY_BLOCKS` more blocks before waiting for spendable
   UTXOs.
+- Channel opening uses `OpenChannelSync`, waits for a pending channel, mines
+  `DEFAULT_CHANNEL_CONFIRMATION_BLOCKS`, then waits for both sides to list the
+  channel as active.
 - LND wallet init may succeed before the `WalletUnlocker` response is usable;
   fallback to `/root/.lnd/data/chain/bitcoin/regtest/admin.macaroon`.
 - Do not leave Docker containers behind after tests or failed startup.
