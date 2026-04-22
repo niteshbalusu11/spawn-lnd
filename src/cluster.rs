@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 
-use lnd_grpc_rust::{LndConnectError, LndNodeClients, LndNodeConfig};
+use lnd_grpc_rust::{LndConnectError, LndNodeClients, LndNodeConfig, lnrpc::ConnectPeerResponse};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
     BITCOIND_P2P_PORT, BitcoinCore, BitcoinCoreConfig, BitcoinCoreError, BitcoinRpcError,
-    CleanupReport, ConfigError, DockerClient, DockerError, LndConfig, LndDaemon, LndError,
-    NodeConfig, SpawnLndConfig,
+    CleanupReport, ConfigError, DEFAULT_GENERATE_ADDRESS, DockerClient, DockerError, LND_P2P_PORT,
+    LndConfig, LndDaemon, LndError, NodeConfig, SpawnLndConfig,
 };
+
+pub const DEFAULT_FUNDING_MATURITY_BLOCKS: u64 = 101;
+const DEFAULT_MIN_FUNDING_SAT: i64 = 1;
 
 #[derive(Debug)]
 pub struct SpawnedCluster {
@@ -91,6 +94,118 @@ impl SpawnedCluster {
             .map_err(SpawnError::ConnectNodes)
     }
 
+    pub async fn connect_peer(
+        &self,
+        from_alias: &str,
+        to_alias: &str,
+    ) -> Result<PeerConnection, SpawnError> {
+        let from = self.require_node(from_alias)?;
+        let to = self.require_node(to_alias)?;
+        let host = lnd_bridge_socket(to)?;
+        let response = from
+            .daemon
+            .connect_peer(to.daemon.public_key.clone(), host.clone())
+            .await
+            .or_else(|error| already_connected_response(error, &to.daemon.public_key))
+            .map_err(|source| SpawnError::Lnd {
+                alias: from_alias.to_string(),
+                source,
+            })?;
+
+        Ok(PeerConnection {
+            from_alias: from_alias.to_string(),
+            to_alias: to_alias.to_string(),
+            public_key: to.daemon.public_key.clone(),
+            socket: host,
+            status: response.status,
+        })
+    }
+
+    pub async fn connect_all_peers(&self) -> Result<Vec<PeerConnection>, SpawnError> {
+        let mut connections = Vec::new();
+
+        for from_alias in &self.node_order {
+            for to_alias in &self.node_order {
+                if from_alias == to_alias {
+                    continue;
+                }
+
+                connections.push(self.connect_peer(from_alias, to_alias).await?);
+            }
+        }
+
+        Ok(connections)
+    }
+
+    pub async fn fund_node(&self, alias: &str) -> Result<FundingReport, SpawnError> {
+        self.fund_node_with_maturity_blocks(alias, DEFAULT_FUNDING_MATURITY_BLOCKS)
+            .await
+    }
+
+    pub async fn fund_node_with_maturity_blocks(
+        &self,
+        alias: &str,
+        maturity_blocks: u64,
+    ) -> Result<FundingReport, SpawnError> {
+        let node = self.require_node(alias)?;
+        let bitcoind = &self.bitcoinds[node.chain_group_index];
+        let address = node
+            .daemon
+            .new_address()
+            .await
+            .map_err(|source| SpawnError::Lnd {
+                alias: alias.to_string(),
+                source,
+            })?;
+
+        let mut block_hashes = bitcoind
+            .rpc
+            .generate_to_address(1, &address)
+            .await
+            .map_err(|source| SpawnError::BitcoinRpc {
+                group_index: node.chain_group_index,
+                source,
+            })?;
+        let maturity_hashes = bitcoind
+            .rpc
+            .generate_to_address(maturity_blocks, DEFAULT_GENERATE_ADDRESS)
+            .await
+            .map_err(|source| SpawnError::BitcoinRpc {
+                group_index: node.chain_group_index,
+                source,
+            })?;
+        block_hashes.extend(maturity_hashes);
+
+        wait_lnd_nodes_synced(&self.nodes, &self.node_order).await?;
+
+        let balance = node
+            .daemon
+            .wait_for_spendable_balance(DEFAULT_MIN_FUNDING_SAT)
+            .await
+            .map_err(|source| SpawnError::Lnd {
+                alias: alias.to_string(),
+                source,
+            })?;
+        let utxos = node
+            .daemon
+            .wait_for_spendable_utxos(DEFAULT_MIN_FUNDING_SAT)
+            .await
+            .map_err(|source| SpawnError::Lnd {
+                alias: alias.to_string(),
+                source,
+            })?;
+        let spendable_utxo_total_sat = utxos.iter().map(|utxo| utxo.amount_sat).sum();
+
+        Ok(FundingReport {
+            alias: alias.to_string(),
+            address,
+            block_hashes,
+            confirmed_balance_sat: balance.confirmed_balance,
+            spendable_utxo_count: utxos.len(),
+            spendable_utxo_total_sat,
+        })
+    }
+
     pub async fn shutdown(&mut self) -> Result<CleanupReport, SpawnError> {
         if self.shutdown || self.config.keep_containers {
             self.shutdown = true;
@@ -100,6 +215,14 @@ impl SpawnedCluster {
         let report = self.docker.cleanup_cluster(&self.cluster_id).await?;
         self.shutdown = true;
         Ok(report)
+    }
+
+    fn require_node(&self, alias: &str) -> Result<&SpawnedNode, SpawnError> {
+        self.nodes
+            .get(alias)
+            .ok_or_else(|| SpawnError::UnknownNode {
+                alias: alias.to_string(),
+            })
     }
 }
 
@@ -151,6 +274,29 @@ impl SpawnedNode {
     pub fn node_config(&self) -> LndNodeConfig {
         self.daemon.node_config()
     }
+
+    pub fn public_key(&self) -> &str {
+        &self.daemon.public_key
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerConnection {
+    pub from_alias: String,
+    pub to_alias: String,
+    pub public_key: String,
+    pub socket: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingReport {
+    pub alias: String,
+    pub address: String,
+    pub block_hashes: Vec<String>,
+    pub confirmed_balance_sat: i64,
+    pub spendable_utxo_count: usize,
+    pub spendable_utxo_total_sat: i64,
 }
 
 #[derive(Debug, Error)]
@@ -174,8 +320,20 @@ pub enum SpawnError {
         source: BitcoinRpcError,
     },
 
+    #[error("Bitcoin Core RPC failed for chain group {group_index}")]
+    BitcoinRpc {
+        group_index: usize,
+        source: BitcoinRpcError,
+    },
+
     #[error("Bitcoin Core chain group {group_index} did not expose a bridge IP address")]
     MissingBitcoindIp { group_index: usize },
+
+    #[error("unknown LND node alias: {alias}")]
+    UnknownNode { alias: String },
+
+    #[error("LND node {alias} did not expose a bridge IP address")]
+    MissingLndIp { alias: String },
 
     #[error("failed to spawn LND node {alias}")]
     Lnd { alias: String, source: LndError },
@@ -333,6 +491,33 @@ fn bitcoind_bridge_socket(
     Ok(format!("{ip}:{BITCOIND_P2P_PORT}"))
 }
 
+fn lnd_bridge_socket(node: &SpawnedNode) -> Result<String, SpawnError> {
+    let ip =
+        node.daemon
+            .container
+            .ip_address
+            .as_deref()
+            .ok_or_else(|| SpawnError::MissingLndIp {
+                alias: node.alias.clone(),
+            })?;
+
+    Ok(format!("{ip}:{LND_P2P_PORT}"))
+}
+
+fn already_connected_response(
+    error: LndError,
+    public_key: &str,
+) -> Result<ConnectPeerResponse, LndError> {
+    match error {
+        LndError::Rpc { message, .. } if message.contains("already connected") => {
+            Ok(ConnectPeerResponse {
+                status: format!("already connected to {public_key}"),
+            })
+        }
+        error => Err(error),
+    }
+}
+
 fn new_cluster_id() -> String {
     format!("cluster-{}", Uuid::new_v4().simple())
 }
@@ -347,7 +532,8 @@ fn empty_cleanup_report() -> CleanupReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{chain_group_index, lnd_config};
+    use super::{already_connected_response, chain_group_index, lnd_config};
+    use crate::LndError;
     use crate::NodeConfig;
 
     #[test]
@@ -369,5 +555,20 @@ mod tests {
         assert_eq!(config.node_index, 2);
         assert_eq!(config.image, "custom/lnd:v1");
         assert_eq!(config.extra_args, ["--alias=Alice", "--color=#3399ff"]);
+    }
+
+    #[test]
+    fn treats_already_connected_peer_as_success() {
+        let response = already_connected_response(
+            LndError::Rpc {
+                socket: "127.0.0.1:10009".to_string(),
+                method: "ConnectPeer",
+                message: "already connected to peer".to_string(),
+            },
+            "pubkey",
+        )
+        .expect("already connected is success");
+
+        assert_eq!(response.status, "already connected to pubkey");
     }
 }

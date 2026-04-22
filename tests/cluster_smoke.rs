@@ -16,6 +16,8 @@ async fn cluster_smoke_spawns_two_nodes_connects_and_cleans()
     assert_eq!(cluster.node("bob").expect("bob").chain_group_index(), 0);
 
     let result = async {
+        let peer = cluster.connect_peer("alice", "bob").await?;
+        let funding = cluster.fund_node("alice").await?;
         let mut clients = cluster.connect_nodes().await?;
         let mut infos = Vec::new();
 
@@ -35,17 +37,29 @@ async fn cluster_smoke_spawns_two_nodes_connects_and_cleans()
             ));
         }
 
-        Ok::<_, Box<dyn std::error::Error>>(infos)
+        Ok::<_, Box<dyn std::error::Error>>((peer, funding, infos))
     }
     .await;
     let cleanup = cluster.shutdown().await;
 
-    let infos = result?;
+    let (peer, funding, infos) = result?;
     let cleanup = cleanup?;
     assert!(
         cleanup.removed >= 3,
         "expected bitcoind and two LND containers to be removed"
     );
+
+    assert_eq!(peer.from_alias, "alice");
+    assert_eq!(peer.to_alias, "bob");
+    assert!(!peer.public_key.is_empty());
+    assert!(peer.socket.ends_with(":9735"));
+
+    assert_eq!(funding.alias, "alice");
+    assert!(!funding.address.is_empty());
+    assert!(funding.block_hashes.len() >= 102);
+    assert!(funding.confirmed_balance_sat > 0);
+    assert!(funding.spendable_utxo_count > 0);
+    assert!(funding.spendable_utxo_total_sat > 0);
 
     for (alias, public_key, synced_to_chain) in infos {
         assert!(!public_key.is_empty());

@@ -15,7 +15,10 @@ pub use bitcoin::{
     BitcoinRpcAuth, BitcoinRpcClient, BitcoinRpcError, BlockInfo, BlockchainInfo,
     DEFAULT_BITCOIN_RPC_USER, bitcoin_core_auth_hmac, bitcoin_core_rpcauth,
 };
-pub use cluster::{SpawnError, SpawnedCluster, SpawnedNode};
+pub use cluster::{
+    DEFAULT_FUNDING_MATURITY_BLOCKS, FundingReport, PeerConnection, SpawnError, SpawnedCluster,
+    SpawnedNode,
+};
 pub use config::{
     ConfigError, DEFAULT_BITCOIND_IMAGE, DEFAULT_LND_IMAGE, DEFAULT_NODE_ALIAS,
     DEFAULT_NODES_PER_BITCOIND, ENV_BITCOIND_IMAGE, ENV_KEEP_CONTAINERS, ENV_LND_IMAGE,

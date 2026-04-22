@@ -2,7 +2,9 @@ use hyper::Uri;
 use lnd_grpc_rust::{
     LndClient, LndNodeConfig, MyChannel,
     lnrpc::{
-        GenSeedRequest, GetInfoRequest, GetInfoResponse, InitWalletRequest,
+        AddressType, ConnectPeerRequest, ConnectPeerResponse, GenSeedRequest, GetInfoRequest,
+        GetInfoResponse, InitWalletRequest, LightningAddress, ListUnspentRequest,
+        NewAddressRequest, Utxo, WalletBalanceRequest, WalletBalanceResponse,
         wallet_unlocker_client::WalletUnlockerClient,
     },
 };
@@ -28,6 +30,7 @@ pub const DEFAULT_GENERATE_ADDRESS: &str = "2N8hwP1WmJrFF5QWABn38y63uYLhnJYJYTF"
 
 const READY_RETRY_ATTEMPTS: usize = 500;
 const READY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_UTXO_CONFIRMATIONS: i32 = i32::MAX;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LndConfig {
@@ -159,6 +162,134 @@ impl LndDaemon {
     pub async fn wait_synced_to_chain(&self) -> Result<GetInfoResponse, LndError> {
         wait_for_synced_get_info(&self.cert_hex, &self.macaroon_hex, &self.rpc_socket).await
     }
+
+    pub async fn new_address(&self) -> Result<String, LndError> {
+        let mut client = self.connect().await?;
+        let response = client
+            .lightning()
+            .new_address(NewAddressRequest {
+                r#type: AddressType::WitnessPubkeyHash as i32,
+                account: String::new(),
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "NewAddress", error))?
+            .into_inner();
+
+        Ok(response.address)
+    }
+
+    pub async fn connect_peer(
+        &self,
+        public_key: impl Into<String>,
+        host: impl Into<String>,
+    ) -> Result<ConnectPeerResponse, LndError> {
+        let mut client = self.connect().await?;
+        let response = client
+            .lightning()
+            .connect_peer(ConnectPeerRequest {
+                addr: Some(LightningAddress {
+                    pubkey: public_key.into(),
+                    host: host.into(),
+                }),
+                perm: false,
+                timeout: 10,
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "ConnectPeer", error))?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    pub async fn wallet_balance(&self, min_confs: i32) -> Result<WalletBalanceResponse, LndError> {
+        let mut client = self.connect().await?;
+        let response = client
+            .lightning()
+            .wallet_balance(WalletBalanceRequest {
+                account: String::new(),
+                min_confs,
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "WalletBalance", error))?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    pub async fn list_unspent(
+        &self,
+        min_confs: i32,
+        max_confs: i32,
+    ) -> Result<Vec<Utxo>, LndError> {
+        let mut client = self.connect().await?;
+        let response = client
+            .lightning()
+            .list_unspent(ListUnspentRequest {
+                min_confs,
+                max_confs,
+                account: String::new(),
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "ListUnspent", error))?
+            .into_inner();
+
+        Ok(response.utxos)
+    }
+
+    pub async fn wait_for_spendable_balance(
+        &self,
+        minimum_sat: i64,
+    ) -> Result<WalletBalanceResponse, LndError> {
+        let mut last_error = None;
+
+        for _ in 0..READY_RETRY_ATTEMPTS {
+            match self.wallet_balance(1).await {
+                Ok(balance) if balance.confirmed_balance >= minimum_sat => return Ok(balance),
+                Ok(balance) => {
+                    last_error = Some(format!(
+                        "confirmed balance {} is below required {minimum_sat}",
+                        balance.confirmed_balance
+                    ));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+
+            sleep(READY_RETRY_INTERVAL).await;
+        }
+
+        Err(LndError::BalanceTimeout {
+            alias: self.alias.clone(),
+            minimum_sat,
+            attempts: READY_RETRY_ATTEMPTS,
+            last_error,
+        })
+    }
+
+    pub async fn wait_for_spendable_utxos(&self, minimum_sat: i64) -> Result<Vec<Utxo>, LndError> {
+        let mut last_error = None;
+
+        for _ in 0..READY_RETRY_ATTEMPTS {
+            match self.list_unspent(1, MAX_UTXO_CONFIRMATIONS).await {
+                Ok(utxos) if utxo_total_sat(&utxos) >= minimum_sat => return Ok(utxos),
+                Ok(utxos) => {
+                    last_error = Some(format!(
+                        "spendable UTXO total {} is below required {minimum_sat}",
+                        utxo_total_sat(&utxos)
+                    ));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+
+            sleep(READY_RETRY_INTERVAL).await;
+        }
+
+        Err(LndError::UtxoTimeout {
+            alias: self.alias.clone(),
+            minimum_sat,
+            attempts: READY_RETRY_ATTEMPTS,
+            last_error,
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -180,6 +311,13 @@ pub enum LndError {
 
     #[error("failed to connect to LND at {socket}: {message}")]
     Connect { socket: String, message: String },
+
+    #[error("LND RPC {method} failed at {socket}: {message}")]
+    Rpc {
+        socket: String,
+        method: &'static str,
+        message: String,
+    },
 
     #[error("failed to create unauthenticated LND channel to {socket}: {message}")]
     UnauthenticatedChannel { socket: String, message: String },
@@ -209,6 +347,36 @@ pub enum LndError {
         attempts: usize,
         last_error: Option<String>,
     },
+
+    #[error(
+        "LND node {alias} did not reach spendable balance {minimum_sat} sat after {attempts} attempts; last error: {last_error:?}"
+    )]
+    BalanceTimeout {
+        alias: String,
+        minimum_sat: i64,
+        attempts: usize,
+        last_error: Option<String>,
+    },
+
+    #[error(
+        "LND node {alias} did not report spendable UTXOs totaling {minimum_sat} sat after {attempts} attempts; last error: {last_error:?}"
+    )]
+    UtxoTimeout {
+        alias: String,
+        minimum_sat: i64,
+        attempts: usize,
+        last_error: Option<String>,
+    },
+}
+
+impl LndError {
+    fn rpc(socket: &str, method: &'static str, error: impl std::fmt::Display) -> Self {
+        Self::Rpc {
+            socket: socket.to_string(),
+            method,
+            message: error.to_string(),
+        }
+    }
 }
 
 fn lnd_container_spec(
@@ -249,6 +417,10 @@ fn lnd_args(bitcoind_ip: &str, bitcoind: &BitcoinCore) -> Vec<String> {
         "--listen=0.0.0.0:9735".to_string(),
         "--rpclisten=0.0.0.0:10009".to_string(),
     ]
+}
+
+fn utxo_total_sat(utxos: &[Utxo]) -> i64 {
+    utxos.iter().map(|utxo| utxo.amount_sat).sum()
 }
 
 async fn wait_for_file(

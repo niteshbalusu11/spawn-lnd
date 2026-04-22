@@ -57,6 +57,9 @@ docker ps -a --filter label=spawn-lnd=true
 - All managed Docker containers must be labeled `spawn-lnd=true`.
 - Cleanup should use cluster labels and be idempotent.
 - LND is not ready until authenticated `GetInfo` reports `synced_to_chain=true`.
+- Cluster funding mines one coinbase block to the LND wallet address and
+  `DEFAULT_FUNDING_MATURITY_BLOCKS` more blocks before waiting for spendable
+  UTXOs.
 - LND wallet init may succeed before the `WalletUnlocker` response is usable;
   fallback to `/root/.lnd/data/chain/bitcoin/regtest/admin.macaroon`.
 - Do not leave Docker containers behind after tests or failed startup.

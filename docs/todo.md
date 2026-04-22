@@ -243,8 +243,8 @@ Primary public types:
 - [x] Allocate unique host ports and internal listener args per node.
 - [x] Return alias-keyed node metadata.
 - [x] Implement `connect_nodes()` using `lnd_grpc_rust::connect_nodes`.
-- [ ] Connect Lightning peers between aliases.
-- [ ] Fund node wallets and wait for mature UTXOs.
+- [x] Connect Lightning peers between aliases.
+- [x] Fund node wallets and wait for mature UTXOs.
 - [x] Add two-node integration test.
 
 ### Milestone 6: Channel Helpers

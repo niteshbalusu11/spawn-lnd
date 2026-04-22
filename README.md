@@ -21,11 +21,12 @@ Implemented:
   default.
 - Alias-keyed node metadata and `connect_nodes()` integration with
   `lnd_grpc_rust`.
+- Lightning peer connection between aliases.
+- Wallet funding by mining regtest coinbase blocks to an LND wallet address and
+  waiting for spendable UTXOs.
 
 In progress:
 
-- Lightning peer connection helpers.
-- Wallet funding helpers.
 - Channel setup helpers.
 - Minimal CLI.
 
@@ -47,6 +48,10 @@ async fn spawn_two_lnds() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let result = async {
+        cluster.connect_peer("alice", "bob").await?;
+        let funding = cluster.fund_node("alice").await?;
+        assert!(funding.spendable_utxo_total_sat > 0);
+
         let mut clients = cluster.connect_nodes().await?;
         let info = clients
             .get_mut("alice")
