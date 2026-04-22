@@ -1,0 +1,989 @@
+use hyper::Uri;
+use lnd_grpc_rust::{
+    LndClient, LndNodeConfig, MyChannel,
+    lnrpc::{
+        AddressType, Channel, ChannelPoint, ConnectPeerRequest, ConnectPeerResponse,
+        GenSeedRequest, GetInfoRequest, GetInfoResponse, InitWalletRequest, LightningAddress,
+        ListChannelsRequest, ListUnspentRequest, NewAddressRequest, OpenChannelRequest,
+        PendingChannelsRequest, PendingChannelsResponse, Utxo, WalletBalanceRequest,
+        WalletBalanceResponse, wallet_unlocker_client::WalletUnlockerClient,
+    },
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::time::{Duration, sleep};
+
+use crate::{
+    BitcoinCore, DEFAULT_LND_IMAGE,
+    bitcoin::BITCOIND_RPC_PORT,
+    docker::{
+        ContainerRole, ContainerSpec, DockerClient, DockerError, SpawnedContainer,
+        managed_container_labels,
+    },
+};
+
+pub const LND_GRPC_PORT: u16 = 10009;
+pub const LND_P2P_PORT: u16 = 9735;
+pub const LND_TLS_CERT_PATH: &str = "/root/.lnd/tls.cert";
+pub const LND_ADMIN_MACAROON_PATH: &str = "/root/.lnd/data/chain/bitcoin/regtest/admin.macaroon";
+pub const LND_WALLET_PASSWORD: &[u8] = b"password";
+pub const DEFAULT_GENERATE_ADDRESS: &str = "2N8hwP1WmJrFF5QWABn38y63uYLhnJYJYTF";
+
+const READY_RETRY_ATTEMPTS: usize = 500;
+const READY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_UTXO_CONFIRMATIONS: i32 = i32::MAX;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LndConfig {
+    pub cluster_id: String,
+    pub alias: String,
+    pub node_index: usize,
+    pub image: String,
+    pub extra_args: Vec<String>,
+}
+
+impl LndConfig {
+    pub fn new(cluster_id: impl Into<String>, alias: impl Into<String>, node_index: usize) -> Self {
+        Self {
+            cluster_id: cluster_id.into(),
+            alias: alias.into(),
+            node_index,
+            image: DEFAULT_LND_IMAGE.to_string(),
+            extra_args: Vec::new(),
+        }
+    }
+
+    pub fn image(mut self, image: impl Into<String>) -> Self {
+        self.image = image.into();
+        self
+    }
+
+    pub fn extra_arg(mut self, arg: impl Into<String>) -> Self {
+        self.extra_args.push(arg.into());
+        self
+    }
+
+    pub fn extra_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extra_args.extend(args.into_iter().map(Into::into));
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LndDaemon {
+    pub alias: String,
+    pub container: SpawnedContainer,
+    pub cert_hex: String,
+    pub macaroon_hex: String,
+    pub rpc_socket: String,
+    pub p2p_socket: String,
+    pub public_key: String,
+}
+
+impl LndDaemon {
+    pub async fn spawn(
+        docker: &DockerClient,
+        bitcoind: &BitcoinCore,
+        config: LndConfig,
+    ) -> Result<Self, LndError> {
+        Self::spawn_with_startup_cleanup(docker, bitcoind, config, true).await
+    }
+
+    pub(crate) async fn spawn_with_startup_cleanup(
+        docker: &DockerClient,
+        bitcoind: &BitcoinCore,
+        config: LndConfig,
+        cleanup_on_startup_failure: bool,
+    ) -> Result<Self, LndError> {
+        bitcoind
+            .rpc
+            .generate_to_address(1, DEFAULT_GENERATE_ADDRESS)
+            .await
+            .map_err(LndError::BitcoinRpc)?;
+
+        let spec = lnd_container_spec(&config, bitcoind)?;
+        let container = docker.create_and_start(spec).await?;
+        let container_id = container.id.clone();
+        let alias = config.alias;
+        let result = Self::initialize_started(docker, container, alias.clone()).await;
+
+        match result {
+            Ok(daemon) => Ok(daemon),
+            Err(error) => {
+                let logs = docker.container_logs(&container_id).await.ok();
+                if cleanup_on_startup_failure {
+                    let _ = docker.rollback_containers([container_id.clone()]).await;
+                }
+                Err(LndError::Startup {
+                    alias,
+                    container_id,
+                    logs,
+                    source: Box::new(error),
+                })
+            }
+        }
+    }
+
+    async fn initialize_started(
+        docker: &DockerClient,
+        container: SpawnedContainer,
+        alias: String,
+    ) -> Result<Self, LndError> {
+        let rpc_port =
+            container
+                .host_port(LND_GRPC_PORT)
+                .ok_or_else(|| LndError::MissingHostPort {
+                    container_id: container.id.clone(),
+                    container_port: LND_GRPC_PORT,
+                })?;
+        let p2p_port =
+            container
+                .host_port(LND_P2P_PORT)
+                .ok_or_else(|| LndError::MissingHostPort {
+                    container_id: container.id.clone(),
+                    container_port: LND_P2P_PORT,
+                })?;
+        let rpc_socket = format!("127.0.0.1:{rpc_port}");
+        let cert_bytes = wait_for_file(docker, &container.id, LND_TLS_CERT_PATH).await?;
+        let cert_hex = hex::encode(&cert_bytes);
+        let macaroon_hex =
+            init_wallet_or_read_macaroon(docker, &container.id, &cert_bytes, &rpc_socket).await?;
+        let info = wait_for_synced_get_info(&cert_hex, &macaroon_hex, &rpc_socket).await?;
+
+        Ok(Self {
+            alias,
+            p2p_socket: format!("127.0.0.1:{p2p_port}"),
+            public_key: info.identity_pubkey,
+            cert_hex,
+            macaroon_hex,
+            rpc_socket,
+            container,
+        })
+    }
+
+    pub fn node_config(&self) -> LndNodeConfig {
+        LndNodeConfig::new(
+            self.alias.clone(),
+            self.cert_hex.clone(),
+            self.macaroon_hex.clone(),
+            self.rpc_socket.clone(),
+        )
+    }
+
+    pub async fn connect(&self) -> Result<LndClient, LndError> {
+        connect_authenticated(&self.cert_hex, &self.macaroon_hex, &self.rpc_socket).await
+    }
+
+    pub async fn wait_synced_to_chain(&self) -> Result<GetInfoResponse, LndError> {
+        wait_for_synced_get_info(&self.cert_hex, &self.macaroon_hex, &self.rpc_socket).await
+    }
+
+    pub async fn new_address(&self) -> Result<String, LndError> {
+        let mut client = self.connect().await?;
+        let response = client
+            .lightning()
+            .new_address(NewAddressRequest {
+                r#type: AddressType::WitnessPubkeyHash as i32,
+                account: String::new(),
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "NewAddress", error))?
+            .into_inner();
+
+        Ok(response.address)
+    }
+
+    pub async fn connect_peer(
+        &self,
+        public_key: impl Into<String>,
+        host: impl Into<String>,
+    ) -> Result<ConnectPeerResponse, LndError> {
+        let public_key = public_key.into();
+        let host = host.into();
+        let mut last_error = None;
+
+        for _ in 0..READY_RETRY_ATTEMPTS {
+            let mut client = match self.connect().await {
+                Ok(client) => client,
+                Err(error) if error.is_lnd_starting() => {
+                    last_error = Some(error.to_string());
+                    sleep(READY_RETRY_INTERVAL).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match client
+                .lightning()
+                .connect_peer(ConnectPeerRequest {
+                    addr: Some(LightningAddress {
+                        pubkey: public_key.clone(),
+                        host: host.clone(),
+                    }),
+                    perm: false,
+                    timeout: 10,
+                })
+                .await
+            {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(error) => {
+                    let error = LndError::rpc(&self.rpc_socket, "ConnectPeer", error);
+                    if error.is_lnd_starting() {
+                        last_error = Some(error.to_string());
+                        sleep(READY_RETRY_INTERVAL).await;
+                        continue;
+                    }
+
+                    return Err(error);
+                }
+            }
+        }
+
+        Err(LndError::PeerConnectTimeout {
+            alias: self.alias.clone(),
+            public_key,
+            attempts: READY_RETRY_ATTEMPTS,
+            last_error,
+        })
+    }
+
+    pub async fn wallet_balance(&self, min_confs: i32) -> Result<WalletBalanceResponse, LndError> {
+        let mut client = self.connect().await?;
+        let response = client
+            .lightning()
+            .wallet_balance(WalletBalanceRequest {
+                account: String::new(),
+                min_confs,
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "WalletBalance", error))?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    pub async fn list_unspent(
+        &self,
+        min_confs: i32,
+        max_confs: i32,
+    ) -> Result<Vec<Utxo>, LndError> {
+        let mut client = self.connect().await?;
+        let response = client
+            .lightning()
+            .list_unspent(ListUnspentRequest {
+                min_confs,
+                max_confs,
+                account: String::new(),
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "ListUnspent", error))?
+            .into_inner();
+
+        Ok(response.utxos)
+    }
+
+    pub async fn wait_for_spendable_balance(
+        &self,
+        minimum_sat: i64,
+    ) -> Result<WalletBalanceResponse, LndError> {
+        let mut last_error = None;
+
+        for _ in 0..READY_RETRY_ATTEMPTS {
+            match self.wallet_balance(1).await {
+                Ok(balance) if balance.confirmed_balance >= minimum_sat => return Ok(balance),
+                Ok(balance) => {
+                    last_error = Some(format!(
+                        "confirmed balance {} is below required {minimum_sat}",
+                        balance.confirmed_balance
+                    ));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+
+            sleep(READY_RETRY_INTERVAL).await;
+        }
+
+        Err(LndError::BalanceTimeout {
+            alias: self.alias.clone(),
+            minimum_sat,
+            attempts: READY_RETRY_ATTEMPTS,
+            last_error,
+        })
+    }
+
+    pub async fn wait_for_spendable_utxos(&self, minimum_sat: i64) -> Result<Vec<Utxo>, LndError> {
+        let mut last_error = None;
+
+        for _ in 0..READY_RETRY_ATTEMPTS {
+            match self.list_unspent(1, MAX_UTXO_CONFIRMATIONS).await {
+                Ok(utxos) if utxo_total_sat(&utxos) >= minimum_sat => return Ok(utxos),
+                Ok(utxos) => {
+                    last_error = Some(format!(
+                        "spendable UTXO total {} is below required {minimum_sat}",
+                        utxo_total_sat(&utxos)
+                    ));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+
+            sleep(READY_RETRY_INTERVAL).await;
+        }
+
+        Err(LndError::UtxoTimeout {
+            alias: self.alias.clone(),
+            minimum_sat,
+            attempts: READY_RETRY_ATTEMPTS,
+            last_error,
+        })
+    }
+
+    pub async fn open_channel_sync(
+        &self,
+        remote_public_key: &str,
+        local_funding_amount_sat: i64,
+        push_sat: i64,
+        private: bool,
+    ) -> Result<ChannelPoint, LndError> {
+        let mut client = self.connect().await?;
+        let remote_public_key =
+            hex::decode(remote_public_key).map_err(|error| LndError::InvalidPublicKey {
+                public_key: remote_public_key.to_string(),
+                message: error.to_string(),
+            })?;
+        let response = client
+            .lightning()
+            .open_channel_sync(OpenChannelRequest {
+                node_pubkey: remote_public_key,
+                local_funding_amount: local_funding_amount_sat,
+                push_sat,
+                target_conf: 1,
+                private,
+                min_confs: 1,
+                spend_unconfirmed: false,
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "OpenChannelSync", error))?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    pub async fn pending_channels(&self) -> Result<PendingChannelsResponse, LndError> {
+        let mut client = self.connect().await?;
+        let response = client
+            .lightning()
+            .pending_channels(PendingChannelsRequest {
+                include_raw_tx: false,
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "PendingChannels", error))?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    pub async fn list_channels(
+        &self,
+        remote_public_key: Option<&str>,
+    ) -> Result<Vec<Channel>, LndError> {
+        let mut client = self.connect().await?;
+        let peer = match remote_public_key {
+            Some(public_key) => {
+                hex::decode(public_key).map_err(|error| LndError::InvalidPublicKey {
+                    public_key: public_key.to_string(),
+                    message: error.to_string(),
+                })?
+            }
+            None => Vec::new(),
+        };
+        let response = client
+            .lightning()
+            .list_channels(ListChannelsRequest {
+                active_only: false,
+                inactive_only: false,
+                public_only: false,
+                private_only: false,
+                peer,
+                peer_alias_lookup: true,
+            })
+            .await
+            .map_err(|error| LndError::rpc(&self.rpc_socket, "ListChannels", error))?
+            .into_inner();
+
+        Ok(response.channels)
+    }
+
+    pub async fn wait_for_pending_channel(
+        &self,
+        remote_public_key: &str,
+        channel_point: &str,
+    ) -> Result<(), LndError> {
+        let mut last_error = None;
+
+        for _ in 0..READY_RETRY_ATTEMPTS {
+            match self.pending_channels().await {
+                Ok(pending) if has_pending_channel(&pending, remote_public_key, channel_point) => {
+                    return Ok(());
+                }
+                Ok(pending) => {
+                    last_error = Some(format!(
+                        "pending channels did not include {channel_point}; count={}",
+                        pending.pending_open_channels.len()
+                    ));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+
+            sleep(READY_RETRY_INTERVAL).await;
+        }
+
+        Err(LndError::PendingChannelTimeout {
+            alias: self.alias.clone(),
+            remote_public_key: remote_public_key.to_string(),
+            channel_point: channel_point.to_string(),
+            attempts: READY_RETRY_ATTEMPTS,
+            last_error,
+        })
+    }
+
+    pub async fn wait_for_active_channel(
+        &self,
+        remote_public_key: &str,
+        channel_point: &str,
+    ) -> Result<Channel, LndError> {
+        let mut last_error = None;
+
+        for _ in 0..READY_RETRY_ATTEMPTS {
+            match self.list_channels(Some(remote_public_key)).await {
+                Ok(channels) => {
+                    if let Some(channel) = channels
+                        .iter()
+                        .find(|channel| channel.channel_point == channel_point && channel.active)
+                    {
+                        return Ok(channel.clone());
+                    }
+
+                    last_error = Some(format!(
+                        "active channels did not include {channel_point}; count={}",
+                        channels.len()
+                    ));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+
+            sleep(READY_RETRY_INTERVAL).await;
+        }
+
+        Err(LndError::ActiveChannelTimeout {
+            alias: self.alias.clone(),
+            remote_public_key: remote_public_key.to_string(),
+            channel_point: channel_point.to_string(),
+            attempts: READY_RETRY_ATTEMPTS,
+            last_error,
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum LndError {
+    #[error(transparent)]
+    Docker(#[from] DockerError),
+
+    #[error(transparent)]
+    BitcoinRpc(#[from] crate::BitcoinRpcError),
+
+    #[error("Bitcoin Core container did not expose a bridge IP address for LND")]
+    MissingBitcoindIp,
+
+    #[error("Docker container {container_id} did not publish expected LND port {container_port}")]
+    MissingHostPort {
+        container_id: String,
+        container_port: u16,
+    },
+
+    #[error("failed to connect to LND at {socket}: {message}")]
+    Connect { socket: String, message: String },
+
+    #[error("LND RPC {method} failed at {socket}: {message}")]
+    Rpc {
+        socket: String,
+        method: &'static str,
+        message: String,
+    },
+
+    #[error("invalid LND public key {public_key}: {message}")]
+    InvalidPublicKey { public_key: String, message: String },
+
+    #[error("LND node {alias} startup failed for container {container_id}; logs: {logs:?}")]
+    Startup {
+        alias: String,
+        container_id: String,
+        logs: Option<String>,
+        source: Box<LndError>,
+    },
+
+    #[error("failed to create unauthenticated LND channel to {socket}: {message}")]
+    UnauthenticatedChannel { socket: String, message: String },
+
+    #[error(
+        "LND wallet init did not complete after {attempts} attempts; last error: {last_error:?}"
+    )]
+    WalletInitTimeout {
+        attempts: usize,
+        last_error: Option<String>,
+    },
+
+    #[error(
+        "LND did not report synced_to_chain after {attempts} attempts; last error: {last_error:?}"
+    )]
+    ReadyTimeout {
+        attempts: usize,
+        last_error: Option<String>,
+    },
+
+    #[error(
+        "LND {container_id} did not produce file {path} after {attempts} attempts; last error: {last_error:?}"
+    )]
+    FileTimeout {
+        container_id: String,
+        path: String,
+        attempts: usize,
+        last_error: Option<String>,
+    },
+
+    #[error(
+        "LND node {alias} did not reach spendable balance {minimum_sat} sat after {attempts} attempts; last error: {last_error:?}"
+    )]
+    BalanceTimeout {
+        alias: String,
+        minimum_sat: i64,
+        attempts: usize,
+        last_error: Option<String>,
+    },
+
+    #[error(
+        "LND node {alias} did not report spendable UTXOs totaling {minimum_sat} sat after {attempts} attempts; last error: {last_error:?}"
+    )]
+    UtxoTimeout {
+        alias: String,
+        minimum_sat: i64,
+        attempts: usize,
+        last_error: Option<String>,
+    },
+
+    #[error(
+        "LND node {alias} did not report pending channel {channel_point} with {remote_public_key} after {attempts} attempts; last error: {last_error:?}"
+    )]
+    PendingChannelTimeout {
+        alias: String,
+        remote_public_key: String,
+        channel_point: String,
+        attempts: usize,
+        last_error: Option<String>,
+    },
+
+    #[error(
+        "LND node {alias} did not report active channel {channel_point} with {remote_public_key} after {attempts} attempts; last error: {last_error:?}"
+    )]
+    ActiveChannelTimeout {
+        alias: String,
+        remote_public_key: String,
+        channel_point: String,
+        attempts: usize,
+        last_error: Option<String>,
+    },
+
+    #[error(
+        "LND node {alias} could not connect peer {public_key} after {attempts} attempts; last error: {last_error:?}"
+    )]
+    PeerConnectTimeout {
+        alias: String,
+        public_key: String,
+        attempts: usize,
+        last_error: Option<String>,
+    },
+}
+
+impl LndError {
+    fn rpc(socket: &str, method: &'static str, error: impl std::fmt::Display) -> Self {
+        Self::Rpc {
+            socket: socket.to_string(),
+            method,
+            message: error.to_string(),
+        }
+    }
+
+    fn is_lnd_starting(&self) -> bool {
+        matches!(
+            self,
+            LndError::Connect { message, .. } | LndError::Rpc { message, .. }
+                if message.contains("server is still in the process of starting")
+        )
+    }
+}
+
+fn lnd_container_spec(
+    config: &LndConfig,
+    bitcoind: &BitcoinCore,
+) -> Result<ContainerSpec, LndError> {
+    let bitcoind_ip = bitcoind
+        .container
+        .ip_address
+        .as_deref()
+        .ok_or(LndError::MissingBitcoindIp)?;
+    let name = format!(
+        "spawn-lnd-{}-lnd-{}-{}",
+        config.cluster_id, config.node_index, config.alias
+    );
+    let labels =
+        managed_container_labels(&config.cluster_id, ContainerRole::Lnd, Some(&config.alias));
+    let mut args = lnd_args(bitcoind_ip, bitcoind);
+
+    args.extend(config.extra_args.clone());
+
+    Ok(ContainerSpec::new(name, config.image.clone())
+        .cmd(args)
+        .labels(labels)
+        .expose_ports([LND_GRPC_PORT, LND_P2P_PORT]))
+}
+
+fn lnd_args(bitcoind_ip: &str, bitcoind: &BitcoinCore) -> Vec<String> {
+    vec![
+        "--bitcoin.regtest".to_string(),
+        "--bitcoin.node=bitcoind".to_string(),
+        "--bitcoind.rpcpolling".to_string(),
+        format!("--bitcoind.rpchost={bitcoind_ip}:{BITCOIND_RPC_PORT}"),
+        format!("--bitcoind.rpcuser={}", bitcoind.auth.user),
+        format!("--bitcoind.rpcpass={}", bitcoind.auth.password),
+        "--debuglevel=info".to_string(),
+        "--noseedbackup".to_string(),
+        "--listen=0.0.0.0:9735".to_string(),
+        "--rpclisten=0.0.0.0:10009".to_string(),
+    ]
+}
+
+fn utxo_total_sat(utxos: &[Utxo]) -> i64 {
+    utxos.iter().map(|utxo| utxo.amount_sat).sum()
+}
+
+pub(crate) fn channel_point_string(channel_point: &ChannelPoint) -> Result<String, LndError> {
+    let funding_txid = match channel_point.funding_txid.as_ref() {
+        Some(lnd_grpc_rust::lnrpc::channel_point::FundingTxid::FundingTxidBytes(bytes)) => {
+            let mut txid = bytes.clone();
+            txid.reverse();
+            hex::encode(txid)
+        }
+        Some(lnd_grpc_rust::lnrpc::channel_point::FundingTxid::FundingTxidStr(txid)) => {
+            txid.clone()
+        }
+        None => {
+            return Err(LndError::Rpc {
+                socket: "<open-channel>".to_string(),
+                method: "OpenChannelSync",
+                message: "response did not include funding txid".to_string(),
+            });
+        }
+    };
+
+    Ok(format!("{}:{}", funding_txid, channel_point.output_index))
+}
+
+fn has_pending_channel(
+    pending: &PendingChannelsResponse,
+    remote_public_key: &str,
+    channel_point: &str,
+) -> bool {
+    pending.pending_open_channels.iter().any(|pending| {
+        pending.channel.as_ref().is_some_and(|channel| {
+            channel.remote_node_pub == remote_public_key && channel.channel_point == channel_point
+        })
+    })
+}
+
+async fn wait_for_file(
+    docker: &DockerClient,
+    container_id: &str,
+    path: &str,
+) -> Result<Vec<u8>, LndError> {
+    let mut last_error = None;
+
+    for _ in 0..READY_RETRY_ATTEMPTS {
+        match docker.copy_file_from_container(container_id, path).await {
+            Ok(file) => return Ok(file),
+            Err(error) => {
+                last_error = Some(error.to_string());
+                sleep(READY_RETRY_INTERVAL).await;
+            }
+        }
+    }
+
+    Err(LndError::FileTimeout {
+        container_id: container_id.to_string(),
+        path: path.to_string(),
+        attempts: READY_RETRY_ATTEMPTS,
+        last_error,
+    })
+}
+
+async fn init_wallet_or_read_macaroon(
+    docker: &DockerClient,
+    container_id: &str,
+    cert_bytes: &[u8],
+    socket: &str,
+) -> Result<String, LndError> {
+    let mut last_error = None;
+
+    for _ in 0..READY_RETRY_ATTEMPTS {
+        let init_error = match init_wallet_once(cert_bytes, socket).await {
+            Ok(macaroon) if !macaroon.is_empty() => return Ok(macaroon),
+            Ok(_) => Some("InitWallet returned an empty admin macaroon".to_string()),
+            Err(error) => Some(error),
+        };
+
+        match docker
+            .copy_file_from_container(container_id, LND_ADMIN_MACAROON_PATH)
+            .await
+        {
+            Ok(macaroon) if !macaroon.is_empty() => return Ok(hex::encode(macaroon)),
+            Ok(_) => {
+                last_error = Some(format!(
+                    "{LND_ADMIN_MACAROON_PATH} was empty; wallet init: {}",
+                    init_error.as_deref().unwrap_or("no error")
+                ));
+            }
+            Err(error) => {
+                last_error = Some(format!(
+                    "failed to read {LND_ADMIN_MACAROON_PATH}: {error}; wallet init: {}",
+                    init_error.as_deref().unwrap_or("no error")
+                ));
+            }
+        }
+
+        sleep(READY_RETRY_INTERVAL).await;
+    }
+
+    Err(LndError::WalletInitTimeout {
+        attempts: READY_RETRY_ATTEMPTS,
+        last_error,
+    })
+}
+
+async fn init_wallet_once(cert_bytes: &[u8], socket: &str) -> Result<String, String> {
+    let channel = unauthenticated_channel(cert_bytes, socket)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut unlocker = WalletUnlockerClient::new(channel);
+    let seed = unlocker
+        .gen_seed(GenSeedRequest {
+            aezeed_passphrase: Vec::new(),
+            seed_entropy: Vec::new(),
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .into_inner()
+        .cipher_seed_mnemonic;
+    let response = unlocker
+        .init_wallet(InitWalletRequest {
+            wallet_password: LND_WALLET_PASSWORD.to_vec(),
+            cipher_seed_mnemonic: seed,
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .into_inner();
+
+    Ok(hex::encode(response.admin_macaroon))
+}
+
+async fn unauthenticated_channel(cert_bytes: &[u8], socket: &str) -> Result<MyChannel, LndError> {
+    let uri = format!("https://{socket}")
+        .parse::<Uri>()
+        .map_err(|error| LndError::UnauthenticatedChannel {
+            socket: socket.to_string(),
+            message: error.to_string(),
+        })?;
+
+    MyChannel::new(Some(cert_bytes.to_vec()), uri)
+        .await
+        .map_err(|error| LndError::UnauthenticatedChannel {
+            socket: socket.to_string(),
+            message: error.to_string(),
+        })
+}
+
+async fn wait_for_synced_get_info(
+    cert_hex: &str,
+    macaroon_hex: &str,
+    socket: &str,
+) -> Result<GetInfoResponse, LndError> {
+    let mut last_error = None;
+
+    for _ in 0..READY_RETRY_ATTEMPTS {
+        match get_synced_info_once(cert_hex, macaroon_hex, socket).await {
+            Ok(info) if info.synced_to_chain => return Ok(info),
+            Ok(info) => {
+                last_error = Some(format!(
+                    "GetInfo returned synced_to_chain=false at height {}",
+                    info.block_height
+                ));
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        sleep(READY_RETRY_INTERVAL).await;
+    }
+
+    Err(LndError::ReadyTimeout {
+        attempts: READY_RETRY_ATTEMPTS,
+        last_error,
+    })
+}
+
+async fn get_synced_info_once(
+    cert_hex: &str,
+    macaroon_hex: &str,
+    socket: &str,
+) -> Result<GetInfoResponse, LndError> {
+    let mut client = connect_authenticated(cert_hex, macaroon_hex, socket).await?;
+    let info = client
+        .lightning()
+        .get_info(GetInfoRequest {})
+        .await
+        .map_err(|error| LndError::Connect {
+            socket: socket.to_string(),
+            message: error.to_string(),
+        })?
+        .into_inner();
+
+    Ok(info)
+}
+
+async fn connect_authenticated(
+    cert_hex: &str,
+    macaroon_hex: &str,
+    socket: &str,
+) -> Result<LndClient, LndError> {
+    lnd_grpc_rust::connect(
+        cert_hex.to_string(),
+        macaroon_hex.to_string(),
+        socket.to_string(),
+    )
+    .await
+    .map_err(|error| LndError::Connect {
+        socket: socket.to_string(),
+        message: error.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::{
+        BitcoinCore, BitcoinRpcAuth, BitcoinRpcClient, DEFAULT_LND_IMAGE,
+        bitcoin::{BITCOIND_P2P_PORT, BITCOIND_RPC_PORT},
+        docker::SpawnedContainer,
+    };
+
+    use lnd_grpc_rust::lnrpc::{ChannelPoint, channel_point};
+
+    use super::{
+        LND_GRPC_PORT, LND_P2P_PORT, LndConfig, channel_point_string, lnd_args, lnd_container_spec,
+    };
+
+    fn fake_bitcoind() -> BitcoinCore {
+        BitcoinCore {
+            container: SpawnedContainer {
+                id: "bitcoind".to_string(),
+                name: Some("bitcoind".to_string()),
+                ip_address: Some("172.17.0.2".to_string()),
+                host_ports: HashMap::from([(BITCOIND_RPC_PORT, 18443), (BITCOIND_P2P_PORT, 18444)]),
+            },
+            auth: BitcoinRpcAuth {
+                user: "bitcoinrpc".to_string(),
+                password: "password".to_string(),
+                rpcauth: "bitcoinrpc:salt$hmac".to_string(),
+            },
+            rpc: BitcoinRpcClient::new("127.0.0.1", 18443, "bitcoinrpc", "password"),
+            wallet_rpc: BitcoinRpcClient::new("127.0.0.1", 18443, "bitcoinrpc", "password")
+                .wallet("spawn-lnd"),
+            rpc_socket: "127.0.0.1:18443".to_string(),
+            p2p_socket: "127.0.0.1:18444".to_string(),
+        }
+    }
+
+    #[test]
+    fn default_lnd_config_uses_pinned_image() {
+        let config = LndConfig::new("cluster-1", "alice", 0);
+
+        assert_eq!(config.cluster_id, "cluster-1");
+        assert_eq!(config.alias, "alice");
+        assert_eq!(config.node_index, 0);
+        assert_eq!(config.image, DEFAULT_LND_IMAGE);
+    }
+
+    #[test]
+    fn builds_lnd_args_for_bitcoind_bridge_ip() {
+        let bitcoind = fake_bitcoind();
+        let args = lnd_args("172.17.0.2", &bitcoind);
+
+        assert!(args.contains(&"--bitcoin.regtest".to_string()));
+        assert!(args.contains(&"--bitcoin.node=bitcoind".to_string()));
+        assert!(args.contains(&"--bitcoind.rpcpolling".to_string()));
+        assert!(args.contains(&"--rpclisten=0.0.0.0:10009".to_string()));
+        assert!(args.contains(&"--listen=0.0.0.0:9735".to_string()));
+        assert!(args.contains(&"--bitcoind.rpchost=172.17.0.2:18443".to_string()));
+        assert!(args.contains(&"--bitcoind.rpcuser=bitcoinrpc".to_string()));
+        assert!(args.contains(&"--bitcoind.rpcpass=password".to_string()));
+        assert!(args.contains(&"--debuglevel=info".to_string()));
+        assert!(args.contains(&"--noseedbackup".to_string()));
+    }
+
+    #[test]
+    fn builds_lnd_container_spec() {
+        let bitcoind = fake_bitcoind();
+        let config = LndConfig::new("cluster-1", "alice", 0).extra_arg("--debuglevel=info");
+
+        let spec = lnd_container_spec(&config, &bitcoind).expect("spec");
+
+        assert_eq!(spec.name, "spawn-lnd-cluster-1-lnd-0-alice");
+        assert_eq!(spec.image, DEFAULT_LND_IMAGE);
+        assert!(spec.cmd.contains(&"--debuglevel=info".to_string()));
+        assert!(spec.exposed_ports.contains(&LND_GRPC_PORT));
+        assert!(spec.exposed_ports.contains(&LND_P2P_PORT));
+    }
+
+    #[test]
+    fn formats_channel_point_string() {
+        let channel_point = ChannelPoint {
+            funding_txid: Some(channel_point::FundingTxid::FundingTxidStr(
+                "txid".to_string(),
+            )),
+            output_index: 1,
+        };
+
+        assert_eq!(
+            channel_point_string(&channel_point).expect("channel point"),
+            "txid:1"
+        );
+    }
+
+    #[test]
+    fn formats_channel_point_bytes_as_display_txid() {
+        let channel_point = ChannelPoint {
+            funding_txid: Some(channel_point::FundingTxid::FundingTxidBytes(vec![
+                0x01, 0x02, 0x03, 0x04,
+            ])),
+            output_index: 0,
+        };
+
+        assert_eq!(
+            channel_point_string(&channel_point).expect("channel point"),
+            "04030201:0"
+        );
+    }
+}
