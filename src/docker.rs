@@ -982,7 +982,12 @@ mod tests {
     #[test]
     fn rollback_guard_tracks_and_disarms_ids() {
         let docker = super::DockerClient::from_bollard(
-            bollard::Docker::connect_with_defaults().expect("construct Docker client"),
+            bollard::Docker::connect_with_http(
+                "http://127.0.0.1:65535",
+                1,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .expect("construct Docker client"),
         );
         let mut rollback = docker.rollback_guard();
 
