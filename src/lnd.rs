@@ -99,13 +99,20 @@ impl LndDaemon {
         let spec = lnd_container_spec(&config, bitcoind)?;
         let container = docker.create_and_start(spec).await?;
         let container_id = container.id.clone();
-        let result = Self::initialize_started(docker, container, config.alias).await;
+        let alias = config.alias;
+        let result = Self::initialize_started(docker, container, alias.clone()).await;
 
         match result {
             Ok(daemon) => Ok(daemon),
             Err(error) => {
-                let _ = docker.rollback_containers([container_id]).await;
-                Err(error)
+                let logs = docker.container_logs(&container_id).await.ok();
+                let _ = docker.rollback_containers([container_id.clone()]).await;
+                Err(LndError::Startup {
+                    alias,
+                    container_id,
+                    logs,
+                    source: Box::new(error),
+                })
             }
         }
     }
@@ -469,6 +476,14 @@ pub enum LndError {
 
     #[error("invalid LND public key {public_key}: {message}")]
     InvalidPublicKey { public_key: String, message: String },
+
+    #[error("LND node {alias} startup failed for container {container_id}; logs: {logs:?}")]
+    Startup {
+        alias: String,
+        container_id: String,
+        logs: Option<String>,
+        source: Box<LndError>,
+    },
 
     #[error("failed to create unauthenticated LND channel to {socket}: {message}")]
     UnauthenticatedChannel { socket: String, message: String },

@@ -1,11 +1,13 @@
 use bollard::{
     Docker,
+    container::LogOutput,
     errors::Error as BollardError,
     models::{ContainerCreateBody, ContainerInspectResponse, HostConfig, PortBinding, PortMap},
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
         DownloadFromContainerOptionsBuilder, InspectContainerOptions, ListContainersOptionsBuilder,
-        RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptionsBuilder,
+        LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
+        StopContainerOptionsBuilder,
     },
 };
 use futures_util::StreamExt;
@@ -20,6 +22,8 @@ pub const LABEL_NODE: &str = "spawn-lnd.node";
 pub const LABEL_ROLE: &str = "spawn-lnd.role";
 
 const STOP_TIMEOUT_SECONDS: i32 = 10;
+const LOG_TAIL_LINES: &str = "200";
+const LOG_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct DockerClient {
@@ -153,6 +157,44 @@ impl DockerClient {
         self.cleanup_by_labels(managed_label_filters()).await
     }
 
+    pub async fn managed_container_ids(&self) -> Result<Vec<String>, DockerError> {
+        self.container_ids_by_labels(managed_label_filters()).await
+    }
+
+    pub async fn cluster_container_ids(
+        &self,
+        cluster_id: &str,
+    ) -> Result<Vec<String>, DockerError> {
+        self.container_ids_by_labels(cluster_label_filters(cluster_id))
+            .await
+    }
+
+    pub async fn container_logs(&self, container_id: &str) -> Result<String, DockerError> {
+        let options = LogsOptionsBuilder::default()
+            .stdout(true)
+            .stderr(true)
+            .tail(LOG_TAIL_LINES)
+            .build();
+        let mut stream = self.docker.logs(container_id, Some(options));
+        let mut logs = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|source| DockerError::ReadContainerLogs {
+                container_id: container_id.to_string(),
+                source,
+            })?;
+            append_log_output(&mut logs, chunk);
+
+            if logs.len() > LOG_MAX_BYTES {
+                logs.truncate(LOG_MAX_BYTES);
+                logs.push_str("\n<truncated>");
+                break;
+            }
+        }
+
+        Ok(logs)
+    }
+
     pub fn rollback_guard(&self) -> StartupRollback<'_> {
         StartupRollback::new(self)
     }
@@ -229,6 +271,26 @@ impl DockerClient {
         } else {
             Err(DockerError::cleanup_failed(report))
         }
+    }
+
+    async fn container_ids_by_labels(
+        &self,
+        label_filters: HashMap<String, Vec<String>>,
+    ) -> Result<Vec<String>, DockerError> {
+        let options = ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&label_filters)
+            .build();
+        let containers = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .map_err(|source| DockerError::ListContainers { source })?;
+
+        Ok(containers
+            .into_iter()
+            .filter_map(|container| container.id)
+            .collect())
     }
 
     async fn stop_and_remove_container(&self, container_id: &str) -> Result<(), CleanupFailure> {
@@ -534,6 +596,12 @@ pub enum DockerError {
         message: String,
     },
 
+    #[error("failed to read logs from Docker container {container_id}")]
+    ReadContainerLogs {
+        container_id: String,
+        source: BollardError,
+    },
+
     #[error("failed to clean up {count} Docker container(s)")]
     CleanupFailed {
         #[source]
@@ -711,6 +779,25 @@ fn extract_first_file_from_tar(bytes: &[u8]) -> Result<Vec<u8>, String> {
     Err("archive did not contain a regular file".to_string())
 }
 
+fn append_log_output(logs: &mut String, output: LogOutput) {
+    let prefix = match &output {
+        LogOutput::StdErr { .. } => "stderr",
+        LogOutput::StdOut { .. } => "stdout",
+        LogOutput::StdIn { .. } => "stdin",
+        LogOutput::Console { .. } => "console",
+    };
+    let message = String::from_utf8_lossy(output.as_ref());
+
+    logs.push('[');
+    logs.push_str(prefix);
+    logs.push_str("] ");
+    logs.push_str(&message);
+
+    if !logs.ends_with('\n') {
+        logs.push('\n');
+    }
+}
+
 fn is_ignorable_stop_error(error: &BollardError) -> bool {
     matches!(docker_status_code(error), Some(304 | 404))
 }
@@ -733,8 +820,9 @@ mod tests {
 
     use super::{
         ContainerRole, ContainerSpec, LABEL_CLUSTER, LABEL_MANAGED, LABEL_MANAGED_VALUE,
-        LABEL_NODE, LABEL_ROLE, cluster_label_filters, extract_first_file_from_tar,
-        managed_container_labels, managed_label_filters, parse_tcp_port_key, published_tcp_ports,
+        LABEL_NODE, LABEL_ROLE, append_log_output, cluster_label_filters,
+        extract_first_file_from_tar, managed_container_labels, managed_label_filters,
+        parse_tcp_port_key, published_tcp_ports,
     };
 
     #[test]
@@ -903,5 +991,19 @@ mod tests {
 
         assert_eq!(rollback.container_ids(), ["container-a", "container-b"]);
         assert_eq!(rollback.disarm(), ["container-a", "container-b"]);
+    }
+
+    #[test]
+    fn formats_log_output_with_stream_prefix() {
+        let mut logs = String::new();
+
+        append_log_output(
+            &mut logs,
+            bollard::container::LogOutput::StdErr {
+                message: "failure".into(),
+            },
+        );
+
+        assert_eq!(logs, "[stderr] failure\n");
     }
 }

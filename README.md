@@ -76,6 +76,12 @@ async fn spawn_two_lnds() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Tests
 
+Docker-backed tests require a local Docker Engine that can pull:
+
+- `lightninglabs/bitcoin-core:30`
+- `lightninglabs/lnd:v0.20.1-beta`
+- `hello-world:latest`
+
 Run normal unit and gated smoke tests without Docker:
 
 ```sh
@@ -90,6 +96,7 @@ RUN_DOCKER_TESTS=1 cargo test --test bitcoind_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test cluster_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test channel_smoke -- --nocapture
+RUN_DOCKER_TESTS=1 cargo test --test startup_failure_smoke -- --nocapture
 ```
 
 Check for leftover managed containers:
@@ -103,6 +110,15 @@ Remove all managed containers:
 ```sh
 docker rm -f $(docker ps -aq --filter label=spawn-lnd=true)
 ```
+
+Keep containers for debugging failed tests:
+
+```sh
+SPAWN_LND_KEEP_CONTAINERS=1 RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --nocapture
+```
+
+Startup failures include a bounded Docker log tail in the typed error when a
+container was created before readiness failed.
 
 ## Startup Flags
 

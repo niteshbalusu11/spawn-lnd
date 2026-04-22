@@ -28,6 +28,8 @@ Bitcoin Core and LND regtest nodes.
 - `tests/lnd_smoke.rs`: gated LND smoke test requiring `synced_to_chain=true`.
 - `tests/cluster_smoke.rs`: gated two-node high-level cluster smoke test.
 - `tests/channel_smoke.rs`: gated channel open/confirm/active smoke test.
+- `tests/startup_failure_smoke.rs`: gated startup failure cleanup regression test.
+- `.github/workflows/ci.yml`: unit and Docker-backed smoke test workflow.
 - `docs/todo.md`: engineering plan and remaining milestones.
 
 ## Commands
@@ -46,6 +48,7 @@ Docker-backed tests are gated:
 RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test cluster_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test channel_smoke -- --nocapture
+RUN_DOCKER_TESTS=1 cargo test --test startup_failure_smoke -- --nocapture
 ```
 
 Cleanup check:
@@ -65,6 +68,9 @@ docker ps -a --filter label=spawn-lnd=true
 - Channel opening uses `OpenChannelSync`, waits for a pending channel, mines
   `DEFAULT_CHANNEL_CONFIRMATION_BLOCKS`, then waits for both sides to list the
   channel as active.
+- Startup failures capture a bounded Docker log tail before cleanup when a
+  container was created.
+- `SPAWN_LND_KEEP_CONTAINERS=1` disables automatic cleanup for debugging.
 - LND wallet init may succeed before the `WalletUnlocker` response is usable;
   fallback to `/root/.lnd/data/chain/bitcoin/regtest/admin.macaroon`.
 - Do not leave Docker containers behind after tests or failed startup.

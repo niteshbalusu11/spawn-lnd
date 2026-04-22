@@ -258,14 +258,14 @@ Primary public types:
 ### Milestone 7: Reliability And CI
 
 - [ ] Add startup timeouts and retry policy configuration.
-- [ ] Capture useful container logs on failure.
-- [ ] Make shutdown idempotent.
-- [ ] Make startup failure cleanup idempotent.
-- [ ] Add tests that intentionally fail during startup and assert containers are
+- [x] Capture useful container logs on failure.
+- [x] Make shutdown idempotent.
+- [x] Make startup failure cleanup idempotent.
+- [x] Add tests that intentionally fail during startup and assert containers are
   removed.
-- [ ] Add `SPAWN_LND_KEEP_CONTAINERS=1` for debugging.
-- [ ] Add CI workflow that runs unit tests and Docker-backed integration tests.
-- [ ] Document Docker requirements and cleanup commands.
+- [x] Add `SPAWN_LND_KEEP_CONTAINERS=1` for debugging.
+- [x] Add CI workflow that runs unit tests and Docker-backed integration tests.
+- [x] Document Docker requirements and cleanup commands.
 
 ### Milestone 8: Minimal CLI
 

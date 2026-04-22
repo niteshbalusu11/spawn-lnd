@@ -62,13 +62,29 @@ impl BitcoinCore {
         let auth = BitcoinRpcAuth::random();
         let spec = bitcoind_container_spec(&config, &auth);
         let container = docker.create_and_start(spec).await?;
-        let core = Self::from_container(container, auth)?;
+        let container_id = container.id.clone();
+        let core = match Self::from_container(container, auth) {
+            Ok(core) => core,
+            Err(error) => {
+                let logs = docker.container_logs(&container_id).await.ok();
+                let _ = docker.rollback_containers([container_id.clone()]).await;
+                return Err(BitcoinCoreError::Startup {
+                    container_id,
+                    logs,
+                    source: Box::new(error),
+                });
+            }
+        };
 
         if let Err(source) = core.wait_ready().await {
-            let _ = docker
-                .rollback_containers([core.container.id.clone()])
-                .await;
-            return Err(source);
+            let logs = docker.container_logs(&core.container.id).await.ok();
+            let container_id = core.container.id.clone();
+            let _ = docker.rollback_containers([container_id.clone()]).await;
+            return Err(BitcoinCoreError::Startup {
+                container_id,
+                logs,
+                source: Box::new(source),
+            });
         }
 
         Ok(core)
@@ -331,6 +347,13 @@ pub enum BitcoinCoreError {
     ReadyTimeout {
         attempts: usize,
         last_error: Option<String>,
+    },
+
+    #[error("Bitcoin Core startup failed for container {container_id}; logs: {logs:?}")]
+    Startup {
+        container_id: String,
+        logs: Option<String>,
+        source: Box<BitcoinCoreError>,
     },
 }
 

@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo check
+      - run: cargo test
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: docker version
+      - run: RUN_DOCKER_TESTS=1 cargo test --test docker_smoke -- --nocapture
+      - run: RUN_DOCKER_TESTS=1 cargo test --test bitcoind_smoke -- --nocapture
+      - run: RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --nocapture
+      - run: RUN_DOCKER_TESTS=1 cargo test --test cluster_smoke -- --nocapture
+      - run: RUN_DOCKER_TESTS=1 cargo test --test channel_smoke -- --nocapture
+      - run: RUN_DOCKER_TESTS=1 cargo test --test startup_failure_smoke -- --nocapture
+      - if: always()
+        run: docker ps -a --filter label=spawn-lnd=true
