@@ -12,13 +12,14 @@ mod lnd;
 
 pub use bitcoin::{
     BITCOIND_P2P_PORT, BITCOIND_RPC_PORT, BitcoinCore, BitcoinCoreConfig, BitcoinCoreError,
-    BitcoinRpcAuth, BitcoinRpcClient, BitcoinRpcError, BlockInfo, BlockchainInfo,
-    DEFAULT_BITCOIN_RPC_USER, bitcoin_core_auth_hmac, bitcoin_core_rpcauth,
+    BitcoinRpcAuth, BitcoinRpcClient, BitcoinRpcError, BlockInfo, BlockchainInfo, CreateWallet,
+    DEFAULT_BITCOIN_RPC_USER, DEFAULT_BITCOIN_WALLET_MATURITY_BLOCKS, DEFAULT_BITCOIN_WALLET_NAME,
+    LoadWallet, bitcoin_core_auth_hmac, bitcoin_core_rpcauth,
 };
 pub use cluster::{
     ChannelReport, DEFAULT_CHANNEL_CAPACITY_SAT, DEFAULT_CHANNEL_CONFIRMATION_BLOCKS,
-    DEFAULT_FUNDING_MATURITY_BLOCKS, FundingReport, PeerConnection, SpawnError, SpawnedCluster,
-    SpawnedNode,
+    DEFAULT_FUNDING_AMOUNT_BTC, DEFAULT_FUNDING_CONFIRMATION_BLOCKS, FundingReport, PeerConnection,
+    SpawnError, SpawnedCluster, SpawnedNode,
 };
 pub use config::{
     ConfigError, DEFAULT_BITCOIND_IMAGE, DEFAULT_LND_IMAGE, DEFAULT_NODE_ALIAS,

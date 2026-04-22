@@ -28,6 +28,7 @@ Bitcoin Core and LND regtest nodes.
 - `tests/lnd_smoke.rs`: gated LND smoke test requiring `synced_to_chain=true`.
 - `tests/cluster_smoke.rs`: gated two-node high-level cluster smoke test.
 - `tests/channel_smoke.rs`: gated channel open/confirm/active smoke test.
+- `tests/e2e_smoke.rs`: gated four-node/two-bitcoind channel ring smoke test.
 - `tests/startup_failure_smoke.rs`: gated startup failure cleanup regression test.
 - `.github/workflows/ci.yml`: unit and Docker-backed smoke test workflow.
 - `docs/todo.md`: engineering plan and remaining milestones.
@@ -48,6 +49,7 @@ Docker-backed tests are gated:
 RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test cluster_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test channel_smoke -- --nocapture
+RUN_DOCKER_TESTS=1 cargo test --test e2e_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test startup_failure_smoke -- --nocapture
 ```
 
@@ -62,9 +64,11 @@ docker ps -a --filter label=spawn-lnd=true
 - All managed Docker containers must be labeled `spawn-lnd=true`.
 - Cleanup should use cluster labels and be idempotent.
 - LND is not ready until authenticated `GetInfo` reports `synced_to_chain=true`.
-- Cluster funding mines one coinbase block to the LND wallet address and
-  `DEFAULT_FUNDING_MATURITY_BLOCKS` more blocks before waiting for spendable
-  UTXOs.
+- The primary Bitcoin Core creates the funding wallet, mines
+  `DEFAULT_BITCOIN_WALLET_MATURITY_BLOCKS` once, then LND funding uses
+  wallet RPC (`sendmany` for batches) and one confirmation block.
+- After any Bitcoin Core group mines, wait for all groups to share the same
+  best chain tip before continuing.
 - Channel opening uses `OpenChannelSync`, waits for a pending channel, mines
   `DEFAULT_CHANNEL_CONFIRMATION_BLOCKS`, then waits for both sides to list the
   channel as active.

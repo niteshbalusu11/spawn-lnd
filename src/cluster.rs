@@ -5,6 +5,7 @@ use lnd_grpc_rust::{
     lnrpc::{Channel, ConnectPeerResponse},
 };
 use thiserror::Error;
+use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 use crate::{
@@ -13,10 +14,13 @@ use crate::{
     LndConfig, LndDaemon, LndError, NodeConfig, SpawnLndConfig, lnd::channel_point_string,
 };
 
-pub const DEFAULT_FUNDING_MATURITY_BLOCKS: u64 = 101;
+pub const DEFAULT_FUNDING_AMOUNT_BTC: f64 = 1.0;
+pub const DEFAULT_FUNDING_CONFIRMATION_BLOCKS: u64 = 1;
 pub const DEFAULT_CHANNEL_CAPACITY_SAT: i64 = 100_000;
 pub const DEFAULT_CHANNEL_CONFIRMATION_BLOCKS: u64 = 6;
 const DEFAULT_MIN_FUNDING_SAT: i64 = 1;
+const BITCOIND_SYNC_RETRY_ATTEMPTS: usize = 500;
+const BITCOIND_SYNC_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub struct SpawnedCluster {
@@ -143,72 +147,118 @@ impl SpawnedCluster {
     }
 
     pub async fn fund_node(&self, alias: &str) -> Result<FundingReport, SpawnError> {
-        self.fund_node_with_maturity_blocks(alias, DEFAULT_FUNDING_MATURITY_BLOCKS)
+        self.fund_node_with_amount(alias, DEFAULT_FUNDING_AMOUNT_BTC)
             .await
     }
 
-    pub async fn fund_node_with_maturity_blocks(
+    pub async fn fund_node_with_amount(
         &self,
         alias: &str,
-        maturity_blocks: u64,
+        amount_btc: f64,
     ) -> Result<FundingReport, SpawnError> {
-        let node = self.require_node(alias)?;
-        let bitcoind = &self.bitcoinds[node.chain_group_index];
-        let address = node
-            .daemon
-            .new_address()
+        let mut reports = self.fund_nodes_with_amount([alias], amount_btc).await?;
+        Ok(reports.remove(0))
+    }
+
+    pub async fn fund_nodes<I, S>(&self, aliases: I) -> Result<Vec<FundingReport>, SpawnError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.fund_nodes_with_amount(aliases, DEFAULT_FUNDING_AMOUNT_BTC)
             .await
-            .map_err(|source| SpawnError::Lnd {
-                alias: alias.to_string(),
+    }
+
+    pub async fn fund_nodes_with_amount<I, S>(
+        &self,
+        aliases: I,
+        amount_btc: f64,
+    ) -> Result<Vec<FundingReport>, SpawnError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut recipients = Vec::new();
+        let mut amounts = HashMap::new();
+
+        for alias in aliases {
+            let alias = alias.as_ref().to_string();
+            let node = self.require_node(&alias)?;
+            let address = node
+                .daemon
+                .new_address()
+                .await
+                .map_err(|source| SpawnError::Lnd {
+                    alias: alias.clone(),
+                    source,
+                })?;
+
+            amounts.insert(address.clone(), amount_btc);
+            recipients.push((alias, address));
+        }
+
+        if recipients.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let funder = &self.bitcoinds[0];
+        let txid = funder
+            .wallet_rpc
+            .send_many(&amounts)
+            .await
+            .map_err(|source| SpawnError::BitcoinRpc {
+                group_index: 0,
+                source,
+            })?;
+        let confirmation_blocks = funder
+            .rpc
+            .generate_to_address(
+                DEFAULT_FUNDING_CONFIRMATION_BLOCKS,
+                DEFAULT_GENERATE_ADDRESS,
+            )
+            .await
+            .map_err(|source| SpawnError::BitcoinRpc {
+                group_index: 0,
                 source,
             })?;
 
-        let mut block_hashes = bitcoind
-            .rpc
-            .generate_to_address(1, &address)
-            .await
-            .map_err(|source| SpawnError::BitcoinRpc {
-                group_index: node.chain_group_index,
-                source,
-            })?;
-        let maturity_hashes = bitcoind
-            .rpc
-            .generate_to_address(maturity_blocks, DEFAULT_GENERATE_ADDRESS)
-            .await
-            .map_err(|source| SpawnError::BitcoinRpc {
-                group_index: node.chain_group_index,
-                source,
-            })?;
-        block_hashes.extend(maturity_hashes);
-
+        wait_bitcoind_groups_synced(&self.bitcoinds).await?;
         wait_lnd_nodes_synced(&self.nodes, &self.node_order).await?;
 
-        let balance = node
-            .daemon
-            .wait_for_spendable_balance(DEFAULT_MIN_FUNDING_SAT)
-            .await
-            .map_err(|source| SpawnError::Lnd {
-                alias: alias.to_string(),
-                source,
-            })?;
-        let utxos = node
-            .daemon
-            .wait_for_spendable_utxos(DEFAULT_MIN_FUNDING_SAT)
-            .await
-            .map_err(|source| SpawnError::Lnd {
-                alias: alias.to_string(),
-                source,
-            })?;
-        let spendable_utxo_total_sat = utxos.iter().map(|utxo| utxo.amount_sat).sum();
+        let mut reports = Vec::with_capacity(recipients.len());
+        for (alias, address) in recipients {
+            let node = self.require_node(&alias)?;
+            let balance = node
+                .daemon
+                .wait_for_spendable_balance(DEFAULT_MIN_FUNDING_SAT)
+                .await
+                .map_err(|source| SpawnError::Lnd {
+                    alias: alias.clone(),
+                    source,
+                })?;
+            let utxos = node
+                .daemon
+                .wait_for_spendable_utxos(DEFAULT_MIN_FUNDING_SAT)
+                .await
+                .map_err(|source| SpawnError::Lnd {
+                    alias: alias.clone(),
+                    source,
+                })?;
+            let spendable_utxo_total_sat = utxos.iter().map(|utxo| utxo.amount_sat).sum();
 
-        Ok(FundingReport {
-            alias: alias.to_string(),
-            address,
-            block_hashes,
-            confirmed_balance_sat: balance.confirmed_balance,
-            spendable_utxo_count: utxos.len(),
-            spendable_utxo_total_sat,
-        })
+            reports.push(FundingReport {
+                alias,
+                address,
+                txid: txid.clone(),
+                amount_btc,
+                confirmation_blocks: confirmation_blocks.clone(),
+                confirmed_balance_sat: balance.confirmed_balance,
+                spendable_utxo_count: utxos.len(),
+                spendable_utxo_total_sat,
+            });
+        }
+
+        Ok(reports)
     }
 
     pub async fn open_channel(
@@ -266,6 +316,7 @@ impl SpawnedCluster {
                 source,
             })?;
 
+        wait_bitcoind_groups_synced(&self.bitcoinds).await?;
         wait_lnd_nodes_synced(&self.nodes, &self.node_order).await?;
 
         let from_channel = from
@@ -379,11 +430,13 @@ pub struct PeerConnection {
     pub status: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FundingReport {
     pub alias: String,
     pub address: String,
-    pub block_hashes: Vec<String>,
+    pub txid: String,
+    pub amount_btc: f64,
+    pub confirmation_blocks: Vec<String>,
     pub confirmed_balance_sat: i64,
     pub spendable_utxo_count: usize,
     pub spendable_utxo_total_sat: i64,
@@ -427,6 +480,14 @@ pub enum SpawnError {
         source: BitcoinRpcError,
     },
 
+    #[error(
+        "Bitcoin Core chain groups did not sync to a common tip after {attempts} attempts; last tips: {last_tips:?}"
+    )]
+    BitcoinSyncTimeout {
+        attempts: usize,
+        last_tips: Vec<String>,
+    },
+
     #[error("Bitcoin Core chain group {group_index} did not expose a bridge IP address")]
     MissingBitcoindIp { group_index: usize },
 
@@ -459,7 +520,10 @@ async fn spawn_inner(
 ) -> Result<SpawnedCluster, SpawnError> {
     let bitcoinds = spawn_bitcoinds(&docker, &config, &cluster_id).await?;
     connect_bitcoind_groups(&bitcoinds).await?;
+    prepare_primary_wallet(&bitcoinds).await?;
+    wait_bitcoind_groups_synced(&bitcoinds).await?;
     let (nodes, node_order) = spawn_lnd_nodes(&docker, &config, &cluster_id, &bitcoinds).await?;
+    wait_bitcoind_groups_synced(&bitcoinds).await?;
     wait_lnd_nodes_synced(&nodes, &node_order).await?;
 
     Ok(SpawnedCluster {
@@ -518,6 +582,60 @@ async fn connect_bitcoind_groups(bitcoinds: &[BitcoinCore]) -> Result<(), SpawnE
     Ok(())
 }
 
+async fn prepare_primary_wallet(bitcoinds: &[BitcoinCore]) -> Result<(), SpawnError> {
+    bitcoinds[0]
+        .prepare_mining_wallet()
+        .await
+        .map_err(|source| SpawnError::BitcoinCore {
+            group_index: 0,
+            source,
+        })?;
+
+    Ok(())
+}
+
+async fn wait_bitcoind_groups_synced(bitcoinds: &[BitcoinCore]) -> Result<(), SpawnError> {
+    if bitcoinds.len() <= 1 {
+        return Ok(());
+    }
+
+    let mut last_tips = Vec::new();
+
+    for _ in 0..BITCOIND_SYNC_RETRY_ATTEMPTS {
+        let mut tips = Vec::with_capacity(bitcoinds.len());
+
+        for (group_index, bitcoind) in bitcoinds.iter().enumerate() {
+            let info = bitcoind.rpc.get_blockchain_info().await.map_err(|source| {
+                SpawnError::BitcoinRpc {
+                    group_index,
+                    source,
+                }
+            })?;
+            tips.push((info.blocks, info.bestblockhash));
+        }
+
+        last_tips = tips
+            .iter()
+            .map(|(height, hash)| format!("{height}:{hash}"))
+            .collect();
+
+        if let Some((target_height, target_hash)) = tips.iter().max_by_key(|(height, _)| *height)
+            && tips
+                .iter()
+                .all(|(height, hash)| height == target_height && hash == target_hash)
+        {
+            return Ok(());
+        }
+
+        sleep(BITCOIND_SYNC_RETRY_INTERVAL).await;
+    }
+
+    Err(SpawnError::BitcoinSyncTimeout {
+        attempts: BITCOIND_SYNC_RETRY_ATTEMPTS,
+        last_tips,
+    })
+}
+
 async fn spawn_lnd_nodes(
     docker: &DockerClient,
     config: &SpawnLndConfig,
@@ -537,6 +655,7 @@ async fn spawn_lnd_nodes(
                 alias: node_config.alias.clone(),
                 source,
             })?;
+        wait_bitcoind_groups_synced(bitcoinds).await?;
         let node = SpawnedNode::new(node_index, chain_group_index, daemon);
 
         node_order.push(node.alias.clone());

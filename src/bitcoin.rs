@@ -15,6 +15,8 @@ use crate::{
 };
 
 pub const DEFAULT_BITCOIN_RPC_USER: &str = "bitcoinrpc";
+pub const DEFAULT_BITCOIN_WALLET_NAME: &str = "spawn-lnd";
+pub const DEFAULT_BITCOIN_WALLET_MATURITY_BLOCKS: u64 = 150;
 pub const BITCOIND_RPC_PORT: u16 = 18443;
 pub const BITCOIND_P2P_PORT: u16 = 18444;
 
@@ -50,6 +52,7 @@ pub struct BitcoinCore {
     pub container: SpawnedContainer,
     pub auth: BitcoinRpcAuth,
     pub rpc: BitcoinRpcClient,
+    pub wallet_rpc: BitcoinRpcClient,
     pub rpc_socket: String,
     pub p2p_socket: String,
 }
@@ -107,6 +110,7 @@ impl BitcoinCore {
             }
         })?;
         let rpc = BitcoinRpcClient::new("127.0.0.1", rpc_port, &auth.user, &auth.password);
+        let wallet_rpc = rpc.wallet(DEFAULT_BITCOIN_WALLET_NAME);
 
         Ok(Self {
             rpc_socket: format!("127.0.0.1:{rpc_port}"),
@@ -114,6 +118,7 @@ impl BitcoinCore {
             container,
             auth,
             rpc,
+            wallet_rpc,
         })
     }
 
@@ -134,6 +139,23 @@ impl BitcoinCore {
             attempts: READY_RETRY_ATTEMPTS,
             last_error: last_error.map(|error| error.to_string()),
         })
+    }
+
+    pub async fn prepare_mining_wallet(&self) -> Result<Vec<String>, BitcoinCoreError> {
+        self.rpc
+            .ensure_wallet(DEFAULT_BITCOIN_WALLET_NAME)
+            .await
+            .map_err(BitcoinCoreError::BitcoinRpc)?;
+        let address = self
+            .wallet_rpc
+            .get_new_address()
+            .await
+            .map_err(BitcoinCoreError::BitcoinRpc)?;
+
+        self.rpc
+            .generate_to_address(DEFAULT_BITCOIN_WALLET_MATURITY_BLOCKS, &address)
+            .await
+            .map_err(BitcoinCoreError::BitcoinRpc)
     }
 }
 
@@ -190,8 +212,56 @@ impl BitcoinRpcClient {
         &self.endpoint
     }
 
+    pub fn wallet(&self, wallet_name: &str) -> Self {
+        Self {
+            endpoint: format!(
+                "{}/wallet/{wallet_name}",
+                self.endpoint.trim_end_matches('/')
+            ),
+            user: self.user.clone(),
+            password: self.password.clone(),
+            client: self.client.clone(),
+        }
+    }
+
     pub async fn get_blockchain_info(&self) -> Result<BlockchainInfo, BitcoinRpcError> {
         self.call("getblockchaininfo", json!([])).await
+    }
+
+    pub async fn list_wallets(&self) -> Result<Vec<String>, BitcoinRpcError> {
+        self.call("listwallets", json!([])).await
+    }
+
+    pub async fn create_wallet(&self, wallet_name: &str) -> Result<CreateWallet, BitcoinRpcError> {
+        self.call("createwallet", json!([wallet_name])).await
+    }
+
+    pub async fn load_wallet(&self, wallet_name: &str) -> Result<LoadWallet, BitcoinRpcError> {
+        self.call("loadwallet", json!([wallet_name])).await
+    }
+
+    pub async fn ensure_wallet(&self, wallet_name: &str) -> Result<(), BitcoinRpcError> {
+        if self
+            .list_wallets()
+            .await?
+            .iter()
+            .any(|loaded| loaded == wallet_name)
+        {
+            return Ok(());
+        }
+
+        match self.load_wallet(wallet_name).await {
+            Ok(_) => Ok(()),
+            Err(BitcoinRpcError::Rpc { .. }) => {
+                self.create_wallet(wallet_name).await?;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn get_new_address(&self) -> Result<String, BitcoinRpcError> {
+        self.call("getnewaddress", json!([])).await
     }
 
     pub async fn generate_to_address(
@@ -210,6 +280,22 @@ impl BitcoinRpcClient {
     pub async fn add_node(&self, socket: &str) -> Result<(), BitcoinRpcError> {
         self.call_value("addnode", json!([socket, "add"])).await?;
         Ok(())
+    }
+
+    pub async fn send_to_address(
+        &self,
+        address: &str,
+        amount_btc: f64,
+    ) -> Result<String, BitcoinRpcError> {
+        self.call("sendtoaddress", json!([address, amount_btc]))
+            .await
+    }
+
+    pub async fn send_many(
+        &self,
+        amounts: &std::collections::HashMap<String, f64>,
+    ) -> Result<String, BitcoinRpcError> {
+        self.call("sendmany", json!(["", amounts])).await
     }
 
     pub async fn call<T>(&self, method: &str, params: Value) -> Result<T, BitcoinRpcError>
@@ -282,6 +368,7 @@ pub struct BlockchainInfo {
     pub chain: String,
     pub blocks: u64,
     pub headers: u64,
+    pub bestblockhash: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -290,6 +377,20 @@ pub struct BlockInfo {
     pub confirmations: Option<u64>,
     pub height: Option<u64>,
     pub tx: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateWallet {
+    pub name: String,
+    #[serde(default)]
+    pub warning: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LoadWallet {
+    pub name: String,
+    #[serde(default)]
+    pub warning: String,
 }
 
 #[derive(Debug, Error)]
@@ -348,6 +449,9 @@ pub enum BitcoinCoreError {
         attempts: usize,
         last_error: Option<String>,
     },
+
+    #[error(transparent)]
+    BitcoinRpc(#[from] BitcoinRpcError),
 
     #[error("Bitcoin Core startup failed for container {container_id}; logs: {logs:?}")]
     Startup {
@@ -462,6 +566,14 @@ mod tests {
         let client = BitcoinRpcClient::new("127.0.0.1", 18443, "user", "pass");
 
         assert_eq!(client.endpoint(), "http://127.0.0.1:18443/");
+    }
+
+    #[test]
+    fn builds_wallet_rpc_endpoint() {
+        let client = BitcoinRpcClient::new("127.0.0.1", 18443, "user", "pass");
+        let wallet = client.wallet("spawn-lnd");
+
+        assert_eq!(wallet.endpoint(), "http://127.0.0.1:18443/wallet/spawn-lnd");
     }
 
     #[test]

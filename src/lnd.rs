@@ -850,6 +850,8 @@ mod tests {
                 rpcauth: "bitcoinrpc:salt$hmac".to_string(),
             },
             rpc: BitcoinRpcClient::new("127.0.0.1", 18443, "bitcoinrpc", "password"),
+            wallet_rpc: BitcoinRpcClient::new("127.0.0.1", 18443, "bitcoinrpc", "password")
+                .wallet("spawn-lnd"),
             rpc_socket: "127.0.0.1:18443".to_string(),
             p2p_socket: "127.0.0.1:18444".to_string(),
         }

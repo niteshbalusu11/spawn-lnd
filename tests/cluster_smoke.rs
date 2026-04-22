@@ -56,7 +56,8 @@ async fn cluster_smoke_spawns_two_nodes_connects_and_cleans()
 
     assert_eq!(funding.alias, "alice");
     assert!(!funding.address.is_empty());
-    assert!(funding.block_hashes.len() >= 102);
+    assert!(!funding.txid.is_empty());
+    assert_eq!(funding.confirmation_blocks.len(), 1);
     assert!(funding.confirmed_balance_sat > 0);
     assert!(funding.spendable_utxo_count > 0);
     assert!(funding.spendable_utxo_total_sat > 0);

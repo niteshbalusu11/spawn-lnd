@@ -22,8 +22,9 @@ Implemented:
 - Alias-keyed node metadata and `connect_nodes()` integration with
   `lnd_grpc_rust`.
 - Lightning peer connection between aliases.
-- Wallet funding by mining regtest coinbase blocks to an LND wallet address and
-  waiting for spendable UTXOs.
+- Wallet funding through a primary Bitcoin Core wallet: mine mature coinbase
+  funds once, then use wallet RPC (`sendmany` for batches) to fund LND wallets
+  and mine one confirmation block.
 - Channel opening helpers that wait for pending state, mine confirmations, and
   wait for both sides to report the channel active.
 
@@ -96,6 +97,7 @@ RUN_DOCKER_TESTS=1 cargo test --test bitcoind_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test cluster_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test channel_smoke -- --nocapture
+RUN_DOCKER_TESTS=1 cargo test --test e2e_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test startup_failure_smoke -- --nocapture
 ```
 
