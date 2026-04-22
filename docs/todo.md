@@ -205,20 +205,20 @@ Primary public types:
 - [x] Implement labeled container creation.
 - [x] Implement port publishing and inspect-based port discovery.
 - [x] Implement stop/remove lifecycle.
-- [ ] Implement startup rollback for partially-created clusters.
+- [x] Implement startup rollback for partially-created clusters.
 - [x] Implement label-based cleanup for a whole cluster id.
 - [x] Implement copy-file-from-container.
-- [ ] Add a gated Docker smoke test.
+- [x] Add a gated Docker smoke test.
 
 ### Milestone 3: Bitcoin Core
 
-- [ ] Implement Bitcoin Core RPC auth generation.
-- [ ] Implement JSON-RPC client.
-- [ ] Spawn Bitcoin Core regtest container.
-- [ ] Wait for `getblockchaininfo`.
-- [ ] Implement `generate_to_address`.
-- [ ] Implement `add_node`.
-- [ ] Add integration test gated by `RUN_DOCKER_TESTS=1`.
+- [x] Implement Bitcoin Core RPC auth generation.
+- [x] Implement JSON-RPC client.
+- [x] Spawn Bitcoin Core regtest container.
+- [x] Wait for `getblockchaininfo`.
+- [x] Implement `generate_to_address`.
+- [x] Implement `add_node`.
+- [x] Add integration test gated by `RUN_DOCKER_TESTS=1`.
 
 ### Milestone 4: Single LND Node
 

@@ -153,6 +153,41 @@ impl DockerClient {
         self.cleanup_by_labels(managed_label_filters()).await
     }
 
+    pub fn rollback_guard(&self) -> StartupRollback<'_> {
+        StartupRollback::new(self)
+    }
+
+    pub async fn rollback_containers<I>(
+        &self,
+        container_ids: I,
+    ) -> Result<CleanupReport, DockerError>
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        let mut report = CleanupReport {
+            matched: 0,
+            removed: 0,
+            failures: Vec::new(),
+        };
+
+        for container_id in container_ids {
+            report.matched += 1;
+            let container_id = container_id.into();
+
+            match self.stop_and_remove_container(&container_id).await {
+                Ok(()) => report.removed += 1,
+                Err(failure) => report.failures.push(failure),
+            }
+        }
+
+        if report.failures.is_empty() {
+            Ok(report)
+        } else {
+            Err(DockerError::cleanup_failed(report))
+        }
+    }
+
     async fn cleanup_by_labels(
         &self,
         label_filters: HashMap<String, Vec<String>>,
@@ -227,6 +262,57 @@ impl DockerClient {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct StartupRollback<'a> {
+    docker: &'a DockerClient,
+    container_ids: Vec<String>,
+    disarmed: bool,
+}
+
+impl<'a> StartupRollback<'a> {
+    fn new(docker: &'a DockerClient) -> Self {
+        Self {
+            docker,
+            container_ids: Vec::new(),
+            disarmed: false,
+        }
+    }
+
+    pub fn record(&mut self, container: &SpawnedContainer) {
+        self.record_id(container.id.clone());
+    }
+
+    pub fn record_id(&mut self, container_id: impl Into<String>) {
+        self.container_ids.push(container_id.into());
+    }
+
+    pub fn container_ids(&self) -> &[String] {
+        &self.container_ids
+    }
+
+    pub fn disarm(mut self) -> Vec<String> {
+        self.disarmed = true;
+        std::mem::take(&mut self.container_ids)
+    }
+
+    pub async fn rollback(mut self) -> Result<CleanupReport, DockerError> {
+        self.disarmed = true;
+        let container_ids = std::mem::take(&mut self.container_ids);
+        self.docker.rollback_containers(container_ids).await
+    }
+}
+
+impl Drop for StartupRollback<'_> {
+    fn drop(&mut self) {
+        if !self.disarmed && !self.container_ids.is_empty() {
+            eprintln!(
+                "spawn-lnd startup rollback guard dropped with {} tracked container(s); call rollback().await to clean them up",
+                self.container_ids.len()
+            );
+        }
     }
 }
 
@@ -803,5 +889,19 @@ mod tests {
         let error = extract_first_file_from_tar(&archive).expect_err("no file");
 
         assert_eq!(error, "archive did not contain a regular file");
+    }
+
+    #[test]
+    fn rollback_guard_tracks_and_disarms_ids() {
+        let docker = super::DockerClient::from_bollard(
+            bollard::Docker::connect_with_defaults().expect("construct Docker client"),
+        );
+        let mut rollback = docker.rollback_guard();
+
+        rollback.record_id("container-a");
+        rollback.record_id("container-b");
+
+        assert_eq!(rollback.container_ids(), ["container-a", "container-b"]);
+        assert_eq!(rollback.disarm(), ["container-a", "container-b"]);
     }
 }
