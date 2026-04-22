@@ -191,22 +191,52 @@ impl LndDaemon {
         public_key: impl Into<String>,
         host: impl Into<String>,
     ) -> Result<ConnectPeerResponse, LndError> {
-        let mut client = self.connect().await?;
-        let response = client
-            .lightning()
-            .connect_peer(ConnectPeerRequest {
-                addr: Some(LightningAddress {
-                    pubkey: public_key.into(),
-                    host: host.into(),
-                }),
-                perm: false,
-                timeout: 10,
-            })
-            .await
-            .map_err(|error| LndError::rpc(&self.rpc_socket, "ConnectPeer", error))?
-            .into_inner();
+        let public_key = public_key.into();
+        let host = host.into();
+        let mut last_error = None;
 
-        Ok(response)
+        for _ in 0..READY_RETRY_ATTEMPTS {
+            let mut client = match self.connect().await {
+                Ok(client) => client,
+                Err(error) if error.is_lnd_starting() => {
+                    last_error = Some(error.to_string());
+                    sleep(READY_RETRY_INTERVAL).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match client
+                .lightning()
+                .connect_peer(ConnectPeerRequest {
+                    addr: Some(LightningAddress {
+                        pubkey: public_key.clone(),
+                        host: host.clone(),
+                    }),
+                    perm: false,
+                    timeout: 10,
+                })
+                .await
+            {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(error) => {
+                    let error = LndError::rpc(&self.rpc_socket, "ConnectPeer", error);
+                    if error.is_lnd_starting() {
+                        last_error = Some(error.to_string());
+                        sleep(READY_RETRY_INTERVAL).await;
+                        continue;
+                    }
+
+                    return Err(error);
+                }
+            }
+        }
+
+        Err(LndError::PeerConnectTimeout {
+            alias: self.alias.clone(),
+            public_key,
+            attempts: READY_RETRY_ATTEMPTS,
+            last_error,
+        })
     }
 
     pub async fn wallet_balance(&self, min_confs: i32) -> Result<WalletBalanceResponse, LndError> {
@@ -555,6 +585,16 @@ pub enum LndError {
         attempts: usize,
         last_error: Option<String>,
     },
+
+    #[error(
+        "LND node {alias} could not connect peer {public_key} after {attempts} attempts; last error: {last_error:?}"
+    )]
+    PeerConnectTimeout {
+        alias: String,
+        public_key: String,
+        attempts: usize,
+        last_error: Option<String>,
+    },
 }
 
 impl LndError {
@@ -564,6 +604,14 @@ impl LndError {
             method,
             message: error.to_string(),
         }
+    }
+
+    fn is_lnd_starting(&self) -> bool {
+        matches!(
+            self,
+            LndError::Connect { message, .. } | LndError::Rpc { message, .. }
+                if message.contains("server is still in the process of starting")
+        )
     }
 }
 

@@ -60,6 +60,7 @@ async fn e2e_smoke_spawns_two_bitcoinds_and_opens_channel_ring()
             let info = bitcoind.rpc.get_blockchain_info().await?;
             chain_tips.push((info.blocks, info.bestblockhash));
         }
+        eprintln!("e2e chain tips: {chain_tips:?}");
 
         Ok::<_, Box<dyn std::error::Error>>((fundings, channels, infos, chain_tips))
     }
