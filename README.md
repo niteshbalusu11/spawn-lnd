@@ -33,6 +33,22 @@ In progress:
 
 - Minimal CLI.
 
+## Installation
+
+Add the library to your crate as a dev-dependency:
+
+```sh
+cargo add spawn-lnd --dev
+```
+
+Most integration tests will also use Tokio and the raw LND gRPC client returned
+by `connect_nodes()`:
+
+```sh
+cargo add tokio --dev --features macros,rt-multi-thread
+cargo add lnd_grpc_rust --dev
+```
+
 ## Default Images
 
 - Bitcoin Core: `lightninglabs/bitcoin-core:30`
@@ -170,6 +186,8 @@ LND uses:
 - `--bitcoind.rpchost=<bitcoind-bridge-ip>:18443`
 - `--bitcoind.rpcuser=<generated>`
 - `--bitcoind.rpcpass=<generated>`
+- `--accept-keysend`
+- `--allow-circular-route`
 - `--debuglevel=info`
 - `--noseedbackup`
 - `--listen=0.0.0.0:9735`
