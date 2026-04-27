@@ -11,15 +11,21 @@ async fn startup_failure_removes_partially_created_containers()
 
     eprintln!("startup failure smoke: connecting to Docker");
     let docker = DockerClient::connect().await?;
-    eprintln!("startup failure smoke: snapshotting managed containers before failure");
-    let before = docker
+    eprintln!("startup failure smoke: snapshotting managed resources before failure");
+    let containers_before = docker
         .managed_container_ids()
         .await?
         .into_iter()
         .collect::<HashSet<_>>();
+    let networks_before = docker
+        .managed_network_ids()
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
     eprintln!(
-        "startup failure smoke: managed containers before={}",
-        before.len()
+        "startup failure smoke: managed containers before={} networks before={}",
+        containers_before.len(),
+        networks_before.len()
     );
 
     eprintln!("startup failure smoke: spawning cluster with missing LND image");
@@ -43,9 +49,18 @@ async fn startup_failure_removes_partially_created_containers()
         .managed_container_ids()
         .await?
         .into_iter()
-        .filter(|id| !before.contains(id))
+        .filter(|id| !containers_before.contains(id))
+        .collect::<Vec<_>>();
+    let leaked_networks = docker
+        .managed_network_ids()
+        .await?
+        .into_iter()
+        .filter(|id| !networks_before.contains(id))
         .collect::<Vec<_>>();
     eprintln!("startup failure smoke: leaked managed containers after failed spawn={leaked:?}");
+    eprintln!(
+        "startup failure smoke: leaked managed networks after failed spawn={leaked_networks:?}"
+    );
     if !leaked.is_empty() {
         eprintln!("startup failure smoke: rolling back leaked containers");
         let _ = docker.rollback_containers(leaked.clone()).await;
@@ -54,6 +69,10 @@ async fn startup_failure_removes_partially_created_containers()
     assert!(
         leaked.is_empty(),
         "failed cluster startup leaked managed containers: {leaked:?}"
+    );
+    assert!(
+        leaked_networks.is_empty(),
+        "failed cluster startup leaked managed networks: {leaked_networks:?}"
     );
 
     Ok(())

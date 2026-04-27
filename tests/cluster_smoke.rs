@@ -1,4 +1,5 @@
 use spawn_lnd::SpawnLnd;
+use std::net::Ipv4Addr;
 
 #[tokio::test]
 async fn cluster_smoke_spawns_two_nodes_connects_and_cleans()
@@ -21,6 +22,37 @@ async fn cluster_smoke_spawns_two_nodes_connects_and_cleans()
     assert_eq!(cluster.node_aliases().collect::<Vec<_>>(), ["alice", "bob"]);
     assert_eq!(cluster.node("alice").expect("alice").chain_group_index(), 0);
     assert_eq!(cluster.node("bob").expect("bob").chain_group_index(), 0);
+    assert!(
+        cluster.network().subnet.contains('/'),
+        "managed network must report a subnet"
+    );
+    let bitcoind_ip = static_ip(&cluster.network().subnet, 10);
+    let alice_ip = static_ip(&cluster.network().subnet, 11);
+    let bob_ip = static_ip(&cluster.network().subnet, 12);
+    assert_eq!(
+        cluster.bitcoinds()[0].container.ip_address.as_deref(),
+        Some(bitcoind_ip.as_str())
+    );
+    assert_eq!(
+        cluster
+            .node("alice")
+            .expect("alice")
+            .lnd()
+            .container
+            .ip_address
+            .as_deref(),
+        Some(alice_ip.as_str())
+    );
+    assert_eq!(
+        cluster
+            .node("bob")
+            .expect("bob")
+            .lnd()
+            .container
+            .ip_address
+            .as_deref(),
+        Some(bob_ip.as_str())
+    );
 
     let result = async {
         eprintln!("cluster smoke: connecting alice -> bob");
@@ -83,8 +115,8 @@ async fn cluster_smoke_spawns_two_nodes_connects_and_cleans()
         cleanup.failures.len()
     );
     assert!(
-        cleanup.removed >= 3,
-        "expected bitcoind and two LND containers to be removed"
+        cleanup.removed >= 4,
+        "expected bitcoind, two LND containers, and network to be removed"
     );
 
     assert_eq!(peer.from_alias, "alice");
@@ -106,4 +138,17 @@ async fn cluster_smoke_spawns_two_nodes_connects_and_cleans()
     }
 
     Ok(())
+}
+
+fn static_ip(subnet: &str, offset: u32) -> String {
+    let (address, prefix) = subnet.split_once('/').expect("CIDR subnet");
+    let address = address.parse::<Ipv4Addr>().expect("IPv4 subnet address");
+    let prefix = prefix.parse::<u8>().expect("IPv4 prefix");
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+
+    Ipv4Addr::from((u32::from(address) & mask) + offset).to_string()
 }

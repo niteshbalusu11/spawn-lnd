@@ -50,8 +50,8 @@ async fn channel_smoke_opens_confirms_and_activates_channel()
         cleanup.failures.len()
     );
     assert!(
-        cleanup.removed >= 3,
-        "expected bitcoind and two LND containers to be removed"
+        cleanup.removed >= 4,
+        "expected bitcoind, two LND containers, and network to be removed"
     );
 
     assert_eq!(funding.alias, "alice");

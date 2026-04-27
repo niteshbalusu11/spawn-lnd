@@ -57,15 +57,15 @@ pub use cluster::{
 pub use config::{
     ConfigError, DEFAULT_BITCOIND_IMAGE, DEFAULT_LND_IMAGE, DEFAULT_NODE_ALIAS,
     DEFAULT_NODES_PER_BITCOIND, DEFAULT_STARTUP_RETRY_ATTEMPTS, DEFAULT_STARTUP_RETRY_INTERVAL_MS,
-    ENV_BITCOIND_IMAGE, ENV_KEEP_CONTAINERS, ENV_LND_IMAGE, ENV_NODES_PER_BITCOIND,
-    ENV_STARTUP_RETRY_ATTEMPTS, ENV_STARTUP_RETRY_INTERVAL_MS, NodeConfig, RetryPolicy, SpawnLnd,
-    SpawnLndBuilder, SpawnLndConfig,
+    ENV_BITCOIND_IMAGE, ENV_CLUSTER_SUBNET, ENV_KEEP_CONTAINERS, ENV_LND_IMAGE,
+    ENV_NODES_PER_BITCOIND, ENV_STARTUP_RETRY_ATTEMPTS, ENV_STARTUP_RETRY_INTERVAL_MS, NodeConfig,
+    RetryPolicy, SpawnLnd, SpawnLndBuilder, SpawnLndConfig,
 };
 pub use docker::{
     CleanupFailure, CleanupReport, ContainerRole, ContainerSpec, DockerClient, DockerError,
     ImageStatus, LABEL_CLUSTER, LABEL_MANAGED, LABEL_MANAGED_VALUE, LABEL_NODE, LABEL_ROLE,
-    SpawnedContainer, StartupRollback, cluster_label_filters, managed_container_labels,
-    managed_label_filters,
+    ManagedNetwork, NetworkSpec, SpawnedContainer, StartupRollback, cluster_label_filters,
+    managed_container_labels, managed_label_filters, managed_network_labels, managed_network_name,
 };
 pub use lnd::{
     DEFAULT_GENERATE_ADDRESS, LND_ADMIN_MACAROON_PATH, LND_GRPC_PORT, LND_P2P_PORT,

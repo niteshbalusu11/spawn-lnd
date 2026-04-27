@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, env};
+use std::{collections::HashSet, env, net::Ipv4Addr};
 use thiserror::Error;
 
 use crate::cluster::{SpawnError, SpawnedCluster};
@@ -29,6 +29,8 @@ pub const ENV_NODES_PER_BITCOIND: &str = "SPAWN_LND_NODES_PER_BITCOIND";
 pub const ENV_STARTUP_RETRY_ATTEMPTS: &str = "SPAWN_LND_STARTUP_RETRY_ATTEMPTS";
 /// Environment variable overriding readiness retry interval milliseconds.
 pub const ENV_STARTUP_RETRY_INTERVAL_MS: &str = "SPAWN_LND_STARTUP_RETRY_INTERVAL_MS";
+/// Environment variable overriding the Docker network IPv4 subnet.
+pub const ENV_CLUSTER_SUBNET: &str = "SPAWN_LND_CLUSTER_SUBNET";
 
 /// Complete cluster configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -45,6 +47,11 @@ pub struct SpawnLndConfig {
     pub keep_containers: bool,
     /// Retry policy used for daemon startup and readiness checks.
     pub startup_retry: RetryPolicy,
+    /// Optional IPv4 subnet used for the managed Docker bridge network.
+    ///
+    /// When omitted, this crate chooses an explicit private subnet so Docker
+    /// accepts static container IP assignment.
+    pub cluster_subnet: Option<String>,
 }
 
 impl SpawnLndConfig {
@@ -166,6 +173,7 @@ pub struct SpawnLndBuilder {
     nodes_per_bitcoind: Option<usize>,
     keep_containers: Option<bool>,
     startup_retry: Option<RetryPolicy>,
+    cluster_subnet: Option<String>,
 }
 
 impl SpawnLndBuilder {
@@ -227,6 +235,12 @@ impl SpawnLndBuilder {
         self
     }
 
+    /// Set the IPv4 subnet for the managed Docker bridge network.
+    pub fn cluster_subnet(mut self, subnet: impl Into<String>) -> Self {
+        self.cluster_subnet = Some(subnet.into());
+        self
+    }
+
     /// Build and validate a [`SpawnLndConfig`].
     pub fn build(self) -> Result<SpawnLndConfig, ConfigError> {
         let bitcoind_image = option_or_env(
@@ -252,6 +266,10 @@ impl SpawnLndBuilder {
                     .unwrap_or(DEFAULT_STARTUP_RETRY_INTERVAL_MS),
             },
         };
+        let cluster_subnet = match self.cluster_subnet {
+            Some(subnet) => Some(subnet),
+            None => env_string(ENV_CLUSTER_SUBNET),
+        };
 
         let nodes = if self.nodes.is_empty() {
             vec![NodeConfig::new(DEFAULT_NODE_ALIAS)]
@@ -266,6 +284,7 @@ impl SpawnLndBuilder {
             nodes_per_bitcoind,
             keep_containers,
             startup_retry,
+            cluster_subnet,
         };
 
         validate_config(&config)?;
@@ -334,6 +353,10 @@ pub enum ConfigError {
     #[error("startup retry interval must be greater than zero milliseconds")]
     InvalidStartupRetryInterval,
 
+    /// A configured Docker network subnet was not valid IPv4 CIDR notation.
+    #[error("cluster subnet must be valid IPv4 CIDR notation, got {0}")]
+    InvalidClusterSubnet(String),
+
     /// An integer environment override could not be parsed.
     #[error("environment variable {var} must be a positive integer, got {value}")]
     InvalidEnvUsize {
@@ -367,6 +390,9 @@ fn validate_config(config: &SpawnLndConfig) -> Result<(), ConfigError> {
 
     if config.startup_retry.interval_ms == 0 {
         return Err(ConfigError::InvalidStartupRetryInterval);
+    }
+    if let Some(subnet) = &config.cluster_subnet {
+        validate_cluster_subnet(subnet)?;
     }
 
     if config.nodes.is_empty() {
@@ -418,6 +444,23 @@ fn validate_image(field: &'static str, image: &str) -> Result<(), ConfigError> {
             field,
             image: image.to_string(),
         });
+    }
+
+    Ok(())
+}
+
+fn validate_cluster_subnet(subnet: &str) -> Result<(), ConfigError> {
+    let Some((address, prefix)) = subnet.split_once('/') else {
+        return Err(ConfigError::InvalidClusterSubnet(subnet.to_string()));
+    };
+    if address.parse::<Ipv4Addr>().is_err() {
+        return Err(ConfigError::InvalidClusterSubnet(subnet.to_string()));
+    }
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return Err(ConfigError::InvalidClusterSubnet(subnet.to_string()));
+    };
+    if prefix > 30 {
+        return Err(ConfigError::InvalidClusterSubnet(subnet.to_string()));
     }
 
     Ok(())
@@ -475,6 +518,13 @@ fn env_bool(var: &str) -> Result<Option<bool>, ConfigError> {
     }
 }
 
+fn env_string(var: &str) -> Option<String> {
+    env::var(var)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -491,6 +541,7 @@ mod tests {
         assert_eq!(config.nodes_per_bitcoind, DEFAULT_NODES_PER_BITCOIND);
         assert!(!config.keep_containers);
         assert_eq!(config.startup_retry, super::RetryPolicy::default());
+        assert_eq!(config.cluster_subnet, None);
         assert_eq!(
             config.node_aliases().collect::<Vec<_>>(),
             [DEFAULT_NODE_ALIAS]
@@ -506,6 +557,7 @@ mod tests {
             .nodes_per_bitcoind(3)
             .keep_containers(true)
             .startup_retry(12, 250)
+            .cluster_subnet("172.28.0.0/16")
             .build()
             .expect("valid config");
 
@@ -513,6 +565,7 @@ mod tests {
         assert_eq!(config.lnd_image, "custom/lnd:v1");
         assert_eq!(config.nodes_per_bitcoind, 3);
         assert_eq!(config.startup_retry, super::RetryPolicy::new(12, 250));
+        assert_eq!(config.cluster_subnet.as_deref(), Some("172.28.0.0/16"));
         assert_eq!(config.chain_group_count(), 2);
         assert!(config.keep_containers);
         assert_eq!(
@@ -623,6 +676,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_cluster_subnet() {
+        let error = SpawnLnd::builder()
+            .cluster_subnet("not-cidr")
+            .build()
+            .expect_err("invalid subnet should fail");
+
+        assert_eq!(
+            error,
+            ConfigError::InvalidClusterSubnet("not-cidr".to_string())
+        );
+    }
+
+    #[test]
     fn validates_direct_config_inputs() {
         let config = SpawnLndConfig {
             nodes: Vec::new(),
@@ -631,6 +697,7 @@ mod tests {
             nodes_per_bitcoind: DEFAULT_NODES_PER_BITCOIND,
             keep_containers: false,
             startup_retry: super::RetryPolicy::default(),
+            cluster_subnet: None,
         };
 
         assert_eq!(config.validate(), Err(ConfigError::EmptyNodes));
@@ -645,6 +712,7 @@ mod tests {
             nodes_per_bitcoind: 0,
             keep_containers: false,
             startup_retry: super::RetryPolicy::default(),
+            cluster_subnet: None,
         };
 
         assert_eq!(config.chain_group_count(), 0);

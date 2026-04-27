@@ -151,8 +151,8 @@ async fn e2e_smoke_spawns_two_bitcoinds_and_opens_channel_ring() -> TestResult<(
         cleanup.failures.len()
     );
     assert!(
-        cleanup.removed >= 6,
-        "expected two bitcoinds and four LND containers to be removed"
+        cleanup.removed >= 7,
+        "expected two bitcoinds, four LND containers, and network to be removed"
     );
 
     assert_eq!(fundings.len(), aliases.len());
