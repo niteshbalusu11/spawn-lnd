@@ -135,9 +135,10 @@ let config = SpawnLnd::builder()
     .build()?;
 ```
 
-By default, Docker chooses a non-overlapping subnet for each managed cluster
-network. `spawn-lnd` then assigns stable container IPs inside that network so
-Bitcoin Core and LND keep the same bridge addresses across container restarts.
+By default, `spawn-lnd` chooses an explicit private subnet for each managed
+cluster network, retrying alternatives if Docker reports an overlap. It then
+assigns stable container IPs inside that network so Bitcoin Core and LND keep
+the same bridge addresses across container restarts.
 
 Environment overrides:
 

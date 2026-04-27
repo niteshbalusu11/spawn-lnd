@@ -49,8 +49,8 @@ pub struct SpawnLndConfig {
     pub startup_retry: RetryPolicy,
     /// Optional IPv4 subnet used for the managed Docker bridge network.
     ///
-    /// When omitted, Docker chooses a non-overlapping subnet and this crate
-    /// assigns static container IPs from the inspected network.
+    /// When omitted, this crate chooses an explicit private subnet so Docker
+    /// accepts static container IP assignment.
     pub cluster_subnet: Option<String>,
 }
 

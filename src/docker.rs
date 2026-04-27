@@ -923,6 +923,17 @@ impl DockerError {
             report: CleanupReportError(report),
         }
     }
+
+    pub(crate) fn is_network_pool_overlap(&self) -> bool {
+        let Self::CreateNetwork { source, .. } = self else {
+            return false;
+        };
+        let Some(message) = docker_response_message(source) else {
+            return false;
+        };
+
+        docker_status_code(source) == Some(400) && message.to_ascii_lowercase().contains("overlap")
+    }
 }
 
 /// Error wrapper used as the source for cleanup failures.
@@ -1134,6 +1145,13 @@ fn is_not_found_error(error: &BollardError) -> bool {
 fn docker_status_code(error: &BollardError) -> Option<u16> {
     match error {
         BollardError::DockerResponseServerError { status_code, .. } => Some(*status_code),
+        _ => None,
+    }
+}
+
+fn docker_response_message(error: &BollardError) -> Option<&str> {
+    match error {
+        BollardError::DockerResponseServerError { message, .. } => Some(message),
         _ => None,
     }
 }

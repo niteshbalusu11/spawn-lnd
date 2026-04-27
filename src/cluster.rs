@@ -24,6 +24,7 @@ pub const DEFAULT_CHANNEL_CAPACITY_SAT: i64 = 100_000;
 /// Default number of blocks mined after opening a channel.
 pub const DEFAULT_CHANNEL_CONFIRMATION_BLOCKS: u64 = 6;
 const SATOSHIS_PER_BTC: f64 = 100_000_000.0;
+const GENERATED_SUBNET_ATTEMPTS: u32 = 64;
 
 /// A running regtest cluster containing Bitcoin Core and LND containers.
 #[derive(Debug)]
@@ -735,12 +736,28 @@ async fn create_cluster_network(
     config: &SpawnLndConfig,
     cluster_id: &str,
 ) -> Result<ManagedNetwork, SpawnError> {
-    let mut spec = NetworkSpec::new(cluster_id);
     if let Some(subnet) = &config.cluster_subnet {
-        spec = spec.subnet(subnet.clone());
+        let spec = NetworkSpec::new(cluster_id).subnet(subnet.clone());
+        return docker.create_network(spec).await.map_err(SpawnError::from);
     }
 
-    docker.create_network(spec).await.map_err(SpawnError::from)
+    let mut last_overlap = None;
+    for attempt in 0..GENERATED_SUBNET_ATTEMPTS {
+        let subnet = generated_cluster_subnet(cluster_id, attempt);
+        let spec = NetworkSpec::new(cluster_id).subnet(subnet);
+
+        match docker.create_network(spec).await {
+            Ok(network) => return Ok(network),
+            Err(error) if error.is_network_pool_overlap() => {
+                last_overlap = Some(error);
+            }
+            Err(error) => return Err(SpawnError::from(error)),
+        }
+    }
+
+    Err(SpawnError::from(
+        last_overlap.expect("at least one generated subnet attempt"),
+    ))
 }
 
 async fn spawn_bitcoinds(
@@ -1050,6 +1067,29 @@ fn first_static_ip_offset() -> u32 {
     10
 }
 
+fn generated_cluster_subnet(cluster_id: &str, attempt: u32) -> String {
+    let slot = fnv1a_u32(cluster_id, attempt) % (64 * 16);
+    let second_octet = 64 + slot / 16;
+    let third_octet = (slot % 16) * 16;
+
+    format!("10.{second_octet}.{third_octet}.0/20")
+}
+
+fn fnv1a_u32(input: &str, attempt: u32) -> u32 {
+    let mut hash = 0x811c9dc5u32;
+    for byte in input
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(attempt.to_le_bytes())
+    {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+
+    hash
+}
+
 fn bitcoind_bridge_socket(
     group_index: usize,
     bitcoind: &BitcoinCore,
@@ -1105,8 +1145,8 @@ fn empty_cleanup_report() -> CleanupReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        Ipv4Subnet, already_connected_response, btc_to_sat, chain_group_index, lnd_config,
-        static_bitcoind_ip, static_lnd_ip,
+        Ipv4Subnet, already_connected_response, btc_to_sat, chain_group_index,
+        generated_cluster_subnet, lnd_config, static_bitcoind_ip, static_lnd_ip,
     };
     use crate::{LndError, ManagedNetwork};
     use crate::{NodeConfig, RetryPolicy, SpawnLndConfig};
@@ -1159,6 +1199,17 @@ mod tests {
         assert_eq!(static_bitcoind_ip(&subnet, 1).unwrap(), "172.28.0.11");
         assert_eq!(static_lnd_ip(&subnet, 2, 0).unwrap(), "172.28.0.12");
         assert_eq!(static_lnd_ip(&subnet, 2, 1).unwrap(), "172.28.0.13");
+    }
+
+    #[test]
+    fn generates_private_cluster_subnets_with_user_configured_prefixes() {
+        let first = generated_cluster_subnet("cluster-1", 0);
+        let second = generated_cluster_subnet("cluster-1", 1);
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("10."));
+        assert!(first.ends_with(".0/20"));
+        assert!(Ipv4Subnet::parse(&first).is_ok());
     }
 
     #[test]
