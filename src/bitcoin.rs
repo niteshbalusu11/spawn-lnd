@@ -165,6 +165,43 @@ impl BitcoinCore {
         })
     }
 
+    fn refresh_from_container(
+        &mut self,
+        container: SpawnedContainer,
+    ) -> Result<(), BitcoinCoreError> {
+        let updated = Self::from_container(container, self.auth.clone())?;
+        *self = updated;
+        Ok(())
+    }
+
+    /// Stop the Bitcoin Core container without removing it.
+    pub async fn stop(&self, docker: &DockerClient) -> Result<(), BitcoinCoreError> {
+        docker.stop_container(&self.container.id).await?;
+        Ok(())
+    }
+
+    /// Start the Bitcoin Core container and wait until RPC is ready.
+    pub async fn start(
+        &mut self,
+        docker: &DockerClient,
+        policy: &RetryPolicy,
+    ) -> Result<BlockchainInfo, BitcoinCoreError> {
+        let container = docker.start_container(&self.container.id).await?;
+        self.refresh_from_container(container)?;
+        self.wait_ready_with_policy(policy).await
+    }
+
+    /// Restart the Bitcoin Core container and wait until RPC is ready.
+    pub async fn restart(
+        &mut self,
+        docker: &DockerClient,
+        policy: &RetryPolicy,
+    ) -> Result<BlockchainInfo, BitcoinCoreError> {
+        let container = docker.restart_container(&self.container.id).await?;
+        self.refresh_from_container(container)?;
+        self.wait_ready_with_policy(policy).await
+    }
+
     /// Wait for `getblockchaininfo` to succeed using the default retry policy.
     pub async fn wait_ready(&self) -> Result<BlockchainInfo, BitcoinCoreError> {
         self.wait_ready_with_policy(&RetryPolicy::default()).await

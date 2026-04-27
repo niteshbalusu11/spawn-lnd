@@ -91,6 +91,7 @@ RUN_DOCKER_TESTS=1 cargo test --test docker_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test bitcoind_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test cluster_smoke -- --nocapture
+RUN_DOCKER_TESTS=1 cargo test --test lifecycle_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test channel_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test e2e_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test startup_failure_smoke -- --nocapture
@@ -118,6 +119,24 @@ SPAWN_LND_KEEP_CONTAINERS=1 RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --
 
 Startup failures include a bounded Docker log tail in the typed error when a
 container was created before readiness failed.
+
+## Lifecycle Control
+
+Clusters expose stop, start, and restart helpers for existing containers:
+
+```rust
+cluster.stop_lnd("alice").await?;
+cluster.start_lnd("alice").await?;
+cluster.restart_lnd("bob").await?;
+
+cluster.stop_bitcoind(0).await?;
+cluster.start_bitcoind(0).await?;
+cluster.restart_bitcoind(0).await?;
+```
+
+These APIs preserve container filesystem state. They do not remove or recreate
+nodes, so LND identity/wallet material and Bitcoin Core regtest data remain in
+the existing containers.
 
 ## Configuration
 

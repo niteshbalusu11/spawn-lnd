@@ -416,6 +416,70 @@ impl SpawnedCluster {
         })
     }
 
+    /// Stop an LND container without removing it.
+    pub async fn stop_lnd(&self, alias: &str) -> Result<(), SpawnError> {
+        let node = self.require_node(alias)?;
+        node.daemon
+            .stop(&self.docker)
+            .await
+            .map_err(|source| SpawnError::Lnd {
+                alias: alias.to_string(),
+                source: Box::new(source),
+            })
+    }
+
+    /// Start an existing LND container and wait until it is synced to chain.
+    pub async fn start_lnd(&mut self, alias: &str) -> Result<(), SpawnError> {
+        let docker = self.docker.clone();
+        let policy = self.config.startup_retry;
+        let node = self.require_node_mut(alias)?;
+        node.daemon
+            .start(&docker, &policy)
+            .await
+            .map_err(|source| SpawnError::Lnd {
+                alias: alias.to_string(),
+                source: Box::new(source),
+            })?;
+        Ok(())
+    }
+
+    /// Restart an LND container and wait until it is synced to chain.
+    pub async fn restart_lnd(&mut self, alias: &str) -> Result<(), SpawnError> {
+        let docker = self.docker.clone();
+        let policy = self.config.startup_retry;
+        let node = self.require_node_mut(alias)?;
+        node.daemon
+            .restart(&docker, &policy)
+            .await
+            .map_err(|source| SpawnError::Lnd {
+                alias: alias.to_string(),
+                source: Box::new(source),
+            })?;
+        Ok(())
+    }
+
+    /// Stop a Bitcoin Core chain group container without removing it.
+    pub async fn stop_bitcoind(&self, group_index: usize) -> Result<(), SpawnError> {
+        let bitcoind = self.require_bitcoind(group_index)?;
+        bitcoind
+            .stop(&self.docker)
+            .await
+            .map_err(|source| SpawnError::BitcoinCore {
+                group_index,
+                source: Box::new(source),
+            })
+    }
+
+    /// Start an existing Bitcoin Core chain group and wait for dependent nodes.
+    pub async fn start_bitcoind(&mut self, group_index: usize) -> Result<(), SpawnError> {
+        self.start_bitcoind_inner(group_index, false).await
+    }
+
+    /// Restart a Bitcoin Core chain group and wait for dependent nodes.
+    pub async fn restart_bitcoind(&mut self, group_index: usize) -> Result<(), SpawnError> {
+        self.start_bitcoind_inner(group_index, true).await
+    }
+
     /// Stop and remove all containers in this cluster unless `keep_containers` is set.
     pub async fn shutdown(&mut self) -> Result<CleanupReport, SpawnError> {
         if self.shutdown || self.config.keep_containers {
@@ -428,12 +492,63 @@ impl SpawnedCluster {
         Ok(report)
     }
 
+    async fn start_bitcoind_inner(
+        &mut self,
+        group_index: usize,
+        restart: bool,
+    ) -> Result<(), SpawnError> {
+        self.require_bitcoind(group_index)?;
+
+        let docker = self.docker.clone();
+        let policy = self.config.startup_retry;
+        let bitcoind = self
+            .bitcoinds
+            .get_mut(group_index)
+            .expect("validated bitcoind group");
+
+        let result = if restart {
+            bitcoind.restart(&docker, &policy).await
+        } else {
+            bitcoind.start(&docker, &policy).await
+        };
+        result.map_err(|source| SpawnError::BitcoinCore {
+            group_index,
+            source: Box::new(source),
+        })?;
+
+        connect_bitcoind_groups(&self.bitcoinds).await?;
+        wait_bitcoind_groups_synced(&self.bitcoinds, &self.config.startup_retry).await?;
+        wait_lnd_nodes_in_group_synced(
+            &self.nodes,
+            &self.node_order,
+            group_index,
+            &self.config.startup_retry,
+        )
+        .await?;
+
+        Ok(())
+    }
+
     fn require_node(&self, alias: &str) -> Result<&SpawnedNode, SpawnError> {
         self.nodes
             .get(alias)
             .ok_or_else(|| SpawnError::UnknownNode {
                 alias: alias.to_string(),
             })
+    }
+
+    fn require_node_mut(&mut self, alias: &str) -> Result<&mut SpawnedNode, SpawnError> {
+        self.nodes
+            .get_mut(alias)
+            .ok_or_else(|| SpawnError::UnknownNode {
+                alias: alias.to_string(),
+            })
+    }
+
+    fn require_bitcoind(&self, group_index: usize) -> Result<&BitcoinCore, SpawnError> {
+        self.bitcoinds
+            .get(group_index)
+            .ok_or(SpawnError::UnknownBitcoindGroup { group_index })
     }
 }
 
@@ -630,6 +745,13 @@ pub enum SpawnError {
     UnknownNode {
         /// Missing alias.
         alias: String,
+    },
+
+    /// A requested Bitcoin Core chain group does not exist.
+    #[error("unknown Bitcoin Core chain group: {group_index}")]
+    UnknownBitcoindGroup {
+        /// Missing chain group index.
+        group_index: usize,
     },
 
     /// A funding amount was not positive and finite.
@@ -923,6 +1045,30 @@ async fn wait_lnd_nodes_synced(
     Ok(())
 }
 
+async fn wait_lnd_nodes_in_group_synced(
+    nodes: &HashMap<String, SpawnedNode>,
+    node_order: &[String],
+    group_index: usize,
+    policy: &RetryPolicy,
+) -> Result<(), SpawnError> {
+    for alias in node_order {
+        let node = &nodes[alias];
+        if node.chain_group_index != group_index {
+            continue;
+        }
+
+        node.daemon
+            .wait_synced_to_chain_with_policy(policy)
+            .await
+            .map_err(|source| SpawnError::Lnd {
+                alias: alias.clone(),
+                source: Box::new(source),
+            })?;
+    }
+
+    Ok(())
+}
+
 fn lnd_config(
     cluster_id: &str,
     node_index: usize,
@@ -1145,10 +1291,11 @@ fn empty_cleanup_report() -> CleanupReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        Ipv4Subnet, already_connected_response, btc_to_sat, chain_group_index,
-        generated_cluster_subnet, lnd_config, static_bitcoind_ip, static_lnd_ip,
+        Ipv4Subnet, SpawnedCluster, already_connected_response, btc_to_sat, chain_group_index,
+        empty_cleanup_report, generated_cluster_subnet, lnd_config, static_bitcoind_ip,
+        static_lnd_ip,
     };
-    use crate::{LndError, ManagedNetwork};
+    use crate::{DockerClient, LndError, ManagedNetwork};
     use crate::{NodeConfig, RetryPolicy, SpawnLndConfig};
 
     #[test]
@@ -1210,6 +1357,50 @@ mod tests {
         assert!(first.starts_with("10."));
         assert!(first.ends_with(".0/20"));
         assert!(Ipv4Subnet::parse(&first).is_ok());
+    }
+
+    #[test]
+    fn validates_lifecycle_targets() {
+        let docker = DockerClient::from_bollard(
+            bollard::Docker::connect_with_http(
+                "http://127.0.0.1:65535",
+                1,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .expect("construct Docker client"),
+        );
+        let cluster = SpawnedCluster {
+            docker,
+            config: SpawnLndConfig {
+                nodes: vec![NodeConfig::new("alice")],
+                bitcoind_image: "custom/bitcoin:30".to_string(),
+                lnd_image: "custom/lnd:v1".to_string(),
+                nodes_per_bitcoind: 3,
+                keep_containers: false,
+                startup_retry: RetryPolicy::default(),
+                cluster_subnet: None,
+            },
+            cluster_id: "cluster-1".to_string(),
+            network: ManagedNetwork {
+                id: "network-id".to_string(),
+                name: "spawn-lnd-cluster-1".to_string(),
+                subnet: "172.28.0.0/16".to_string(),
+            },
+            bitcoinds: Vec::new(),
+            nodes: Default::default(),
+            node_order: Vec::new(),
+            shutdown: true,
+        };
+
+        assert!(matches!(
+            cluster.require_node("alice"),
+            Err(super::SpawnError::UnknownNode { alias }) if alias == "alice"
+        ));
+        assert!(matches!(
+            cluster.require_bitcoind(0),
+            Err(super::SpawnError::UnknownBitcoindGroup { group_index: 0 })
+        ));
+        assert_eq!(empty_cleanup_report().removed, 0);
     }
 
     #[test]
