@@ -2,12 +2,16 @@ use bollard::{
     Docker,
     container::LogOutput,
     errors::Error as BollardError,
-    models::{ContainerCreateBody, ContainerInspectResponse, HostConfig, PortBinding, PortMap},
+    models::{
+        ContainerCreateBody, ContainerInspectResponse, EndpointIpamConfig, EndpointSettings,
+        HostConfig, Ipam, IpamConfig, NetworkCreateRequest, NetworkInspect, NetworkingConfig,
+        PortBinding, PortMap,
+    },
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
         DownloadFromContainerOptionsBuilder, InspectContainerOptions, ListContainersOptionsBuilder,
-        LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
-        StopContainerOptionsBuilder,
+        ListNetworksOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+        StartContainerOptions, StopContainerOptionsBuilder,
     },
 };
 use futures_util::StreamExt;
@@ -130,6 +134,39 @@ impl DockerClient {
         SpawnedContainer::from_inspect(response.id, inspect)
     }
 
+    /// Create a managed Docker network and return its inspected metadata.
+    pub async fn create_network(&self, spec: NetworkSpec) -> Result<ManagedNetwork, DockerError> {
+        let response = self
+            .docker
+            .create_network(spec.create_request())
+            .await
+            .map_err(|source| DockerError::CreateNetwork {
+                name: spec.name.clone(),
+                source,
+            })?;
+        let inspect = self
+            .docker
+            .inspect_network(&response.id, None)
+            .await
+            .map_err(|source| DockerError::InspectNetwork {
+                network: response.id.clone(),
+                source,
+            })?;
+
+        ManagedNetwork::from_inspect(response.id, spec.name, inspect)
+    }
+
+    /// Remove a Docker network by id or name.
+    pub async fn remove_network(&self, network: &str) -> Result<(), DockerError> {
+        self.docker
+            .remove_network(network)
+            .await
+            .map_err(|source| DockerError::RemoveNetwork {
+                network: network.to_string(),
+                source,
+            })
+    }
+
     /// Copy a single file from a container and return its bytes.
     pub async fn copy_file_from_container(
         &self,
@@ -162,18 +199,36 @@ impl DockerClient {
 
     /// Remove all managed containers with the given cluster id.
     pub async fn cleanup_cluster(&self, cluster_id: &str) -> Result<CleanupReport, DockerError> {
-        self.cleanup_by_labels(cluster_label_filters(cluster_id))
-            .await
+        let mut report = self
+            .cleanup_containers_by_labels(cluster_label_filters(cluster_id))
+            .await?;
+        report.extend(
+            self.cleanup_networks_by_labels(cluster_label_filters(cluster_id))
+                .await?,
+        );
+        cleanup_result(report)
     }
 
-    /// Remove all containers managed by this crate.
+    /// Remove all containers and networks managed by this crate.
     pub async fn cleanup_all(&self) -> Result<CleanupReport, DockerError> {
-        self.cleanup_by_labels(managed_label_filters()).await
+        let mut report = self
+            .cleanup_containers_by_labels(managed_label_filters())
+            .await?;
+        report.extend(
+            self.cleanup_networks_by_labels(managed_label_filters())
+                .await?,
+        );
+        cleanup_result(report)
     }
 
     /// Return ids for all containers managed by this crate.
     pub async fn managed_container_ids(&self) -> Result<Vec<String>, DockerError> {
         self.container_ids_by_labels(managed_label_filters()).await
+    }
+
+    /// Return ids for all networks managed by this crate.
+    pub async fn managed_network_ids(&self) -> Result<Vec<String>, DockerError> {
+        self.network_ids_by_labels(managed_label_filters()).await
     }
 
     /// Return ids for all managed containers with the given cluster id.
@@ -182,6 +237,12 @@ impl DockerClient {
         cluster_id: &str,
     ) -> Result<Vec<String>, DockerError> {
         self.container_ids_by_labels(cluster_label_filters(cluster_id))
+            .await
+    }
+
+    /// Return ids for all managed networks with the given cluster id.
+    pub async fn cluster_network_ids(&self, cluster_id: &str) -> Result<Vec<String>, DockerError> {
+        self.network_ids_by_labels(cluster_label_filters(cluster_id))
             .await
     }
 
@@ -249,7 +310,7 @@ impl DockerClient {
         }
     }
 
-    async fn cleanup_by_labels(
+    async fn cleanup_containers_by_labels(
         &self,
         label_filters: HashMap<String, Vec<String>>,
     ) -> Result<CleanupReport, DockerError> {
@@ -285,11 +346,45 @@ impl DockerClient {
             }
         }
 
-        if report.failures.is_empty() {
-            Ok(report)
-        } else {
-            Err(DockerError::cleanup_failed(report))
+        Ok(report)
+    }
+
+    async fn cleanup_networks_by_labels(
+        &self,
+        label_filters: HashMap<String, Vec<String>>,
+    ) -> Result<CleanupReport, DockerError> {
+        let options = ListNetworksOptionsBuilder::new()
+            .filters(&label_filters)
+            .build();
+        let networks = self
+            .docker
+            .list_networks(Some(options))
+            .await
+            .map_err(|source| DockerError::ListNetworks { source })?;
+
+        let mut report = CleanupReport {
+            matched: networks.len(),
+            removed: 0,
+            failures: Vec::new(),
+        };
+
+        for network in networks {
+            let network_id = network
+                .id
+                .or(network.name)
+                .unwrap_or_else(|| "<missing>".to_string());
+
+            match self.remove_network(&network_id).await {
+                Ok(()) => report.removed += 1,
+                Err(error) => report.failures.push(CleanupFailure {
+                    container_id: network_id,
+                    operation: "remove-network".to_string(),
+                    message: error.to_string(),
+                }),
+            }
         }
+
+        Ok(report)
     }
 
     async fn container_ids_by_labels(
@@ -309,6 +404,25 @@ impl DockerClient {
         Ok(containers
             .into_iter()
             .filter_map(|container| container.id)
+            .collect())
+    }
+
+    async fn network_ids_by_labels(
+        &self,
+        label_filters: HashMap<String, Vec<String>>,
+    ) -> Result<Vec<String>, DockerError> {
+        let options = ListNetworksOptionsBuilder::new()
+            .filters(&label_filters)
+            .build();
+        let networks = self
+            .docker
+            .list_networks(Some(options))
+            .await
+            .map_err(|source| DockerError::ListNetworks { source })?;
+
+        Ok(networks
+            .into_iter()
+            .filter_map(|network| network.id)
             .collect())
     }
 
@@ -418,6 +532,8 @@ pub struct ContainerSpec {
     pub exposed_ports: Vec<u16>,
     /// Optional Docker network mode/name.
     pub network: Option<String>,
+    /// Optional static IPv4 address on the configured Docker network.
+    pub ipv4_address: Option<String>,
 }
 
 impl ContainerSpec {
@@ -431,6 +547,7 @@ impl ContainerSpec {
             labels: HashMap::new(),
             exposed_ports: Vec::new(),
             network: None,
+            ipv4_address: None,
         }
     }
 
@@ -481,6 +598,12 @@ impl ContainerSpec {
         self
     }
 
+    /// Set a static IPv4 address for this container on its configured network.
+    pub fn ipv4_address(mut self, ip: impl Into<String>) -> Self {
+        self.ipv4_address = Some(ip.into());
+        self
+    }
+
     fn create_body(&self) -> ContainerCreateBody {
         ContainerCreateBody {
             image: Some(self.image.clone()),
@@ -496,8 +619,102 @@ impl ContainerSpec {
                     .then(|| port_bindings(&self.exposed_ports)),
                 ..Default::default()
             }),
+            networking_config: self.networking_config(),
             ..Default::default()
         }
+    }
+
+    fn networking_config(&self) -> Option<NetworkingConfig> {
+        let network = self.network.as_ref()?;
+        let ipv4_address = self.ipv4_address.as_ref()?;
+
+        Some(NetworkingConfig {
+            endpoints_config: Some(HashMap::from([(
+                network.clone(),
+                EndpointSettings {
+                    ipam_config: Some(EndpointIpamConfig {
+                        ipv4_address: Some(ipv4_address.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )])),
+        })
+    }
+}
+
+/// Docker network creation parameters used by [`DockerClient`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NetworkSpec {
+    /// Network name.
+    pub name: String,
+    /// Docker labels.
+    pub labels: HashMap<String, String>,
+    /// Optional IPv4 subnet in CIDR notation.
+    pub subnet: Option<String>,
+}
+
+impl NetworkSpec {
+    /// Create a managed bridge network spec for a cluster.
+    pub fn new(cluster_id: &str) -> Self {
+        Self {
+            name: managed_network_name(cluster_id),
+            labels: managed_network_labels(cluster_id),
+            subnet: None,
+        }
+    }
+
+    /// Set the IPv4 subnet for this network.
+    pub fn subnet(mut self, subnet: impl Into<String>) -> Self {
+        self.subnet = Some(subnet.into());
+        self
+    }
+
+    fn create_request(&self) -> NetworkCreateRequest {
+        NetworkCreateRequest {
+            name: self.name.clone(),
+            driver: Some("bridge".to_string()),
+            attachable: Some(false),
+            ipam: self.subnet.as_ref().map(|subnet| Ipam {
+                config: Some(vec![IpamConfig {
+                    subnet: Some(subnet.clone()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            labels: Some(self.labels.clone()),
+            ..Default::default()
+        }
+    }
+}
+
+/// Metadata for a Docker network managed by this crate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManagedNetwork {
+    /// Docker network id.
+    pub id: String,
+    /// Docker network name.
+    pub name: String,
+    /// IPv4 subnet assigned to the network.
+    pub subnet: String,
+}
+
+impl ManagedNetwork {
+    fn from_inspect(
+        id: String,
+        fallback_name: String,
+        inspect: NetworkInspect,
+    ) -> Result<Self, DockerError> {
+        let name = inspect.name.unwrap_or(fallback_name);
+        let subnet = inspect
+            .ipam
+            .and_then(|ipam| ipam.config)
+            .and_then(|configs| configs.into_iter().find_map(|config| config.subnet))
+            .ok_or_else(|| DockerError::MissingNetworkSubnet {
+                network: id.clone(),
+            })?;
+
+        Ok(Self { id, name, subnet })
     }
 }
 
@@ -564,11 +781,11 @@ impl ContainerRole {
 /// Summary of a cleanup operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CleanupReport {
-    /// Number of containers matched for cleanup.
+    /// Number of Docker resources matched for cleanup.
     pub matched: usize,
-    /// Number of containers successfully removed.
+    /// Number of Docker resources successfully removed.
     pub removed: usize,
-    /// Per-container cleanup failures.
+    /// Per-resource cleanup failures.
     pub failures: Vec<CleanupFailure>,
 }
 
@@ -577,12 +794,18 @@ impl CleanupReport {
     pub fn is_success(&self) -> bool {
         self.failures.is_empty()
     }
+
+    fn extend(&mut self, other: CleanupReport) {
+        self.matched += other.matched;
+        self.removed += other.removed;
+        self.failures.extend(other.failures);
+    }
 }
 
-/// Failure for one container cleanup operation.
+/// Failure for one Docker resource cleanup operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CleanupFailure {
-    /// Docker container id.
+    /// Docker resource id.
     pub container_id: String,
     /// Operation that failed, such as `stop` or `remove`.
     pub operation: String,
@@ -613,6 +836,9 @@ pub enum DockerError {
     #[error("failed to list Docker containers")]
     ListContainers { source: BollardError },
 
+    #[error("failed to list Docker networks")]
+    ListNetworks { source: BollardError },
+
     #[error("failed to inspect Docker image {image}")]
     InspectImage { image: String, source: BollardError },
 
@@ -637,6 +863,24 @@ pub enum DockerError {
         container_id: String,
         source: BollardError,
     },
+
+    #[error("failed to create Docker network {name}")]
+    CreateNetwork { name: String, source: BollardError },
+
+    #[error("failed to inspect Docker network {network}")]
+    InspectNetwork {
+        network: String,
+        source: BollardError,
+    },
+
+    #[error("failed to remove Docker network {network}")]
+    RemoveNetwork {
+        network: String,
+        source: BollardError,
+    },
+
+    #[error("Docker network {network} did not report an IPv4 subnet")]
+    MissingNetworkSubnet { network: String },
 
     #[error("Docker reported invalid host port {host_port} for container port {container_port}")]
     InvalidPublishedPort {
@@ -692,7 +936,7 @@ impl std::fmt::Display for CleanupReportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} cleanup failure(s) after matching {} container(s)",
+            "{} cleanup failure(s) after matching {} Docker resource(s)",
             self.0.failures.len(),
             self.0.matched
         )
@@ -720,6 +964,19 @@ pub fn managed_container_labels(
     labels
 }
 
+/// Build the Docker labels applied to every managed network.
+pub fn managed_network_labels(cluster_id: &str) -> HashMap<String, String> {
+    HashMap::from([
+        (LABEL_MANAGED.to_string(), LABEL_MANAGED_VALUE.to_string()),
+        (LABEL_CLUSTER.to_string(), cluster_id.to_string()),
+    ])
+}
+
+/// Build the Docker network name for a cluster.
+pub fn managed_network_name(cluster_id: &str) -> String {
+    format!("spawn-lnd-{cluster_id}")
+}
+
 /// Build Docker list filters that match all containers managed by this crate.
 pub fn managed_label_filters() -> HashMap<String, Vec<String>> {
     label_filters([format!("{LABEL_MANAGED}={LABEL_MANAGED_VALUE}")])
@@ -735,6 +992,14 @@ pub fn cluster_label_filters(cluster_id: &str) -> HashMap<String, Vec<String>> {
 
 fn label_filters(labels: impl IntoIterator<Item = String>) -> HashMap<String, Vec<String>> {
     HashMap::from([("label".to_string(), labels.into_iter().collect())])
+}
+
+fn cleanup_result(report: CleanupReport) -> Result<CleanupReport, DockerError> {
+    if report.failures.is_empty() {
+        Ok(report)
+    } else {
+        Err(DockerError::cleanup_failed(report))
+    }
 }
 
 fn exposed_ports(ports: &[u16]) -> Vec<String> {
@@ -882,7 +1147,7 @@ mod tests {
         ContainerRole, ContainerSpec, LABEL_CLUSTER, LABEL_MANAGED, LABEL_MANAGED_VALUE,
         LABEL_NODE, LABEL_ROLE, append_log_output, cluster_label_filters,
         extract_first_file_from_tar, managed_container_labels, managed_label_filters,
-        parse_tcp_port_key, published_tcp_ports,
+        managed_network_labels, managed_network_name, parse_tcp_port_key, published_tcp_ports,
     };
 
     #[test]
@@ -903,6 +1168,16 @@ mod tests {
         assert_eq!(labels.get(LABEL_CLUSTER).unwrap(), "cluster-1");
         assert_eq!(labels.get(LABEL_ROLE).unwrap(), "bitcoind");
         assert!(!labels.contains_key(LABEL_NODE));
+    }
+
+    #[test]
+    fn builds_managed_network_labels_and_name() {
+        let labels = managed_network_labels("cluster-1");
+
+        assert_eq!(managed_network_name("cluster-1"), "spawn-lnd-cluster-1");
+        assert_eq!(labels.get(LABEL_MANAGED).unwrap(), LABEL_MANAGED_VALUE);
+        assert_eq!(labels.get(LABEL_CLUSTER).unwrap(), "cluster-1");
+        assert!(!labels.contains_key(LABEL_ROLE));
     }
 
     #[test]
@@ -936,11 +1211,19 @@ mod tests {
             .env(["A=B"])
             .labels(labels)
             .expose_ports([18443, 18444])
-            .network("bridge");
+            .network("spawn-lnd-cluster-1")
+            .ipv4_address("172.28.0.10");
 
         let body = spec.create_body();
         let host_config = body.host_config.expect("host config");
         let port_bindings = host_config.port_bindings.expect("port bindings");
+        let endpoint = body
+            .networking_config
+            .expect("networking config")
+            .endpoints_config
+            .expect("endpoints config")
+            .remove("spawn-lnd-cluster-1")
+            .expect("network endpoint");
 
         assert_eq!(body.image.as_deref(), Some("lightninglabs/bitcoin-core:30"));
         assert_eq!(body.cmd.unwrap(), ["bitcoind", "-regtest"]);
@@ -950,7 +1233,17 @@ mod tests {
             LABEL_MANAGED_VALUE
         );
         assert_eq!(host_config.auto_remove, Some(false));
-        assert_eq!(host_config.network_mode.as_deref(), Some("bridge"));
+        assert_eq!(
+            host_config.network_mode.as_deref(),
+            Some("spawn-lnd-cluster-1")
+        );
+        assert_eq!(
+            endpoint
+                .ipam_config
+                .and_then(|ipam| ipam.ipv4_address)
+                .as_deref(),
+            Some("172.28.0.10")
+        );
         assert!(
             body.exposed_ports
                 .unwrap()

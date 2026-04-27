@@ -54,6 +54,10 @@ pub struct LndConfig {
     pub extra_args: Vec<String>,
     /// Retry policy used while waiting for wallet init and chain sync.
     pub startup_retry: RetryPolicy,
+    /// Optional Docker network name.
+    pub network: Option<String>,
+    /// Optional static IPv4 address on the configured Docker network.
+    pub ipv4_address: Option<String>,
 }
 
 impl LndConfig {
@@ -66,6 +70,8 @@ impl LndConfig {
             image: DEFAULT_LND_IMAGE.to_string(),
             extra_args: Vec::new(),
             startup_retry: RetryPolicy::default(),
+            network: None,
+            ipv4_address: None,
         }
     }
 
@@ -94,6 +100,18 @@ impl LndConfig {
     /// Override the startup retry policy.
     pub fn startup_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.startup_retry = policy;
+        self
+    }
+
+    /// Attach this LND container to a Docker network.
+    pub fn network(mut self, network: impl Into<String>) -> Self {
+        self.network = Some(network.into());
+        self
+    }
+
+    /// Assign a static IPv4 address on the configured Docker network.
+    pub fn ipv4_address(mut self, ip: impl Into<String>) -> Self {
+        self.ipv4_address = Some(ip.into());
         self
     }
 }
@@ -712,10 +730,19 @@ fn lnd_container_spec(
 
     args.extend(config.extra_args.clone());
 
-    Ok(ContainerSpec::new(name, config.image.clone())
+    let mut spec = ContainerSpec::new(name, config.image.clone())
         .cmd(args)
         .labels(labels)
-        .expose_ports([LND_GRPC_PORT, LND_P2P_PORT]))
+        .expose_ports([LND_GRPC_PORT, LND_P2P_PORT]);
+
+    if let Some(network) = &config.network {
+        spec = spec.network(network.clone());
+    }
+    if let Some(ipv4_address) = &config.ipv4_address {
+        spec = spec.ipv4_address(ipv4_address.clone());
+    }
+
+    Ok(spec)
 }
 
 fn lnd_args(bitcoind_ip: &str, bitcoind: &BitcoinCore) -> Vec<String> {

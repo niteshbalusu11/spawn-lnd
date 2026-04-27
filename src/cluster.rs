@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, net::Ipv4Addr};
 
 use lnd_grpc_rust::{
     LndConnectError, LndNodeClients, LndNodeConfig,
@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::{
     BITCOIND_P2P_PORT, BitcoinCore, BitcoinCoreConfig, BitcoinCoreError, BitcoinRpcError,
     CleanupReport, ConfigError, DEFAULT_GENERATE_ADDRESS, DockerClient, DockerError, LND_P2P_PORT,
-    LndConfig, LndDaemon, LndError, NodeConfig, RetryPolicy, SpawnLndConfig,
-    lnd::channel_point_string,
+    LndConfig, LndDaemon, LndError, ManagedNetwork, NetworkSpec, NodeConfig, RetryPolicy,
+    SpawnLndConfig, lnd::channel_point_string,
 };
 
 /// Default on-chain funding amount sent to each LND node.
@@ -31,6 +31,7 @@ pub struct SpawnedCluster {
     docker: DockerClient,
     config: SpawnLndConfig,
     cluster_id: String,
+    network: ManagedNetwork,
     bitcoinds: Vec<BitcoinCore>,
     nodes: HashMap<String, SpawnedNode>,
     node_order: Vec<String>,
@@ -90,6 +91,11 @@ impl SpawnedCluster {
     /// Return the config used to spawn this cluster.
     pub fn config(&self) -> &SpawnLndConfig {
         &self.config
+    }
+
+    /// Return the managed Docker network used by this cluster.
+    pub fn network(&self) -> &ManagedNetwork {
+        &self.network
     }
 
     /// Return all spawned Bitcoin Core chain groups.
@@ -652,6 +658,28 @@ pub enum SpawnError {
     #[error(transparent)]
     ConnectNodes(#[from] LndConnectError),
 
+    /// The managed Docker network did not report a usable IPv4 subnet.
+    #[error("cluster network subnet {subnet} is not usable for static IP assignment: {message}")]
+    InvalidClusterNetworkSubnet {
+        /// Docker network subnet.
+        subnet: String,
+        /// Validation failure.
+        message: String,
+    },
+
+    /// The managed Docker network subnet was too small for this cluster.
+    #[error(
+        "cluster network subnet {subnet} cannot assign static IP offset {offset}; largest usable offset is {largest_usable_offset}"
+    )]
+    StaticIpUnavailable {
+        /// Docker network subnet.
+        subnet: String,
+        /// Requested host offset.
+        offset: u32,
+        /// Largest usable host offset in the subnet.
+        largest_usable_offset: u32,
+    },
+
     /// Startup failed and the attempted cleanup also failed.
     #[error(
         "startup failed for cluster {cluster_id}, then cleanup failed; startup error: {startup_error}"
@@ -671,11 +699,22 @@ async fn spawn_inner(
     config: SpawnLndConfig,
     cluster_id: String,
 ) -> Result<SpawnedCluster, SpawnError> {
-    let bitcoinds = spawn_bitcoinds(&docker, &config, &cluster_id).await?;
+    let network = create_cluster_network(&docker, &config, &cluster_id).await?;
+    let subnet = Ipv4Subnet::parse(&network.subnet).map_err(|message| {
+        SpawnError::InvalidClusterNetworkSubnet {
+            subnet: network.subnet.clone(),
+            message,
+        }
+    })?;
+
+    ensure_static_ip_capacity(&config, &subnet)?;
+
+    let bitcoinds = spawn_bitcoinds(&docker, &config, &cluster_id, &network, &subnet).await?;
     connect_bitcoind_groups(&bitcoinds).await?;
     prepare_primary_wallet(&bitcoinds).await?;
     wait_bitcoind_groups_synced(&bitcoinds, &config.startup_retry).await?;
-    let (nodes, node_order) = spawn_lnd_nodes(&docker, &config, &cluster_id, &bitcoinds).await?;
+    let (nodes, node_order) =
+        spawn_lnd_nodes(&docker, &config, &cluster_id, &network, &subnet, &bitcoinds).await?;
     wait_bitcoind_groups_synced(&bitcoinds, &config.startup_retry).await?;
     wait_lnd_nodes_synced(&nodes, &node_order, &config.startup_retry).await?;
 
@@ -683,6 +722,7 @@ async fn spawn_inner(
         docker,
         config,
         cluster_id,
+        network,
         bitcoinds,
         nodes,
         node_order,
@@ -690,10 +730,25 @@ async fn spawn_inner(
     })
 }
 
+async fn create_cluster_network(
+    docker: &DockerClient,
+    config: &SpawnLndConfig,
+    cluster_id: &str,
+) -> Result<ManagedNetwork, SpawnError> {
+    let mut spec = NetworkSpec::new(cluster_id);
+    if let Some(subnet) = &config.cluster_subnet {
+        spec = spec.subnet(subnet.clone());
+    }
+
+    docker.create_network(spec).await.map_err(SpawnError::from)
+}
+
 async fn spawn_bitcoinds(
     docker: &DockerClient,
     config: &SpawnLndConfig,
     cluster_id: &str,
+    network: &ManagedNetwork,
+    subnet: &Ipv4Subnet,
 ) -> Result<Vec<BitcoinCore>, SpawnError> {
     let mut bitcoinds = Vec::with_capacity(config.chain_group_count());
 
@@ -702,7 +757,9 @@ async fn spawn_bitcoinds(
             docker,
             BitcoinCoreConfig::new(cluster_id, group_index)
                 .image(config.bitcoind_image.clone())
-                .startup_retry_policy(config.startup_retry),
+                .startup_retry_policy(config.startup_retry)
+                .network(network.name.clone())
+                .ipv4_address(static_bitcoind_ip(subnet, group_index)?),
         )
         .await
         .map_err(|source| SpawnError::BitcoinCore {
@@ -798,6 +855,8 @@ async fn spawn_lnd_nodes(
     docker: &DockerClient,
     config: &SpawnLndConfig,
     cluster_id: &str,
+    network: &ManagedNetwork,
+    subnet: &Ipv4Subnet,
     bitcoinds: &[BitcoinCore],
 ) -> Result<(HashMap<String, SpawnedNode>, Vec<String>), SpawnError> {
     let mut nodes = HashMap::with_capacity(config.nodes.len());
@@ -806,7 +865,7 @@ async fn spawn_lnd_nodes(
     for (node_index, node_config) in config.nodes.iter().enumerate() {
         let chain_group_index = chain_group_index(node_index, config.nodes_per_bitcoind);
         let bitcoind = &bitcoinds[chain_group_index];
-        let lnd_config = lnd_config(cluster_id, node_index, node_config, config);
+        let lnd_config = lnd_config(cluster_id, node_index, node_config, config, network, subnet)?;
         let daemon = LndDaemon::spawn_with_startup_cleanup(
             docker,
             bitcoind,
@@ -852,11 +911,21 @@ fn lnd_config(
     node_index: usize,
     node_config: &NodeConfig,
     config: &SpawnLndConfig,
-) -> LndConfig {
-    LndConfig::new(cluster_id, node_config.alias.clone(), node_index)
-        .image(config.lnd_image.clone())
-        .extra_args(node_config.lnd_args.clone())
-        .startup_retry_policy(config.startup_retry)
+    network: &ManagedNetwork,
+    subnet: &Ipv4Subnet,
+) -> Result<LndConfig, SpawnError> {
+    Ok(
+        LndConfig::new(cluster_id, node_config.alias.clone(), node_index)
+            .image(config.lnd_image.clone())
+            .extra_args(node_config.lnd_args.clone())
+            .startup_retry_policy(config.startup_retry)
+            .network(network.name.clone())
+            .ipv4_address(static_lnd_ip(
+                subnet,
+                config.chain_group_count(),
+                node_index,
+            )?),
+    )
 }
 
 fn chain_group_index(node_index: usize, nodes_per_bitcoind: usize) -> usize {
@@ -874,6 +943,111 @@ fn btc_to_sat(amount_btc: f64) -> Result<i64, SpawnError> {
     }
 
     Ok(amount_sat as i64)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Ipv4Subnet {
+    cidr: String,
+    network: u32,
+    prefix: u8,
+}
+
+impl Ipv4Subnet {
+    fn parse(cidr: &str) -> Result<Self, String> {
+        let (address, prefix) = cidr
+            .split_once('/')
+            .ok_or_else(|| "missing CIDR prefix".to_string())?;
+        let address = address
+            .parse::<Ipv4Addr>()
+            .map_err(|error| format!("invalid IPv4 address: {error}"))?;
+        let prefix = prefix
+            .parse::<u8>()
+            .map_err(|error| format!("invalid prefix length: {error}"))?;
+        if prefix > 30 {
+            return Err("prefix must be 30 or less".to_string());
+        }
+
+        let mask = ipv4_mask(prefix);
+        Ok(Self {
+            cidr: cidr.to_string(),
+            network: u32::from(address) & mask,
+            prefix,
+        })
+    }
+
+    fn static_ip(&self, offset: u32) -> Result<String, SpawnError> {
+        let largest_usable_offset = self.largest_usable_offset();
+        if offset < 2 || offset > largest_usable_offset {
+            return Err(SpawnError::StaticIpUnavailable {
+                subnet: self.cidr.clone(),
+                offset,
+                largest_usable_offset,
+            });
+        }
+
+        Ok(Ipv4Addr::from(self.network + offset).to_string())
+    }
+
+    fn largest_usable_offset(&self) -> u32 {
+        let size = 1u64 << (32 - self.prefix);
+        size.saturating_sub(2).min(u32::MAX as u64) as u32
+    }
+}
+
+fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn ensure_static_ip_capacity(
+    config: &SpawnLndConfig,
+    subnet: &Ipv4Subnet,
+) -> Result<(), SpawnError> {
+    let required_offset = first_static_ip_offset()
+        .checked_add(config.chain_group_count() as u32)
+        .and_then(|offset| offset.checked_add(config.nodes.len() as u32))
+        .and_then(|offset| offset.checked_sub(1))
+        .ok_or_else(|| SpawnError::StaticIpUnavailable {
+            subnet: subnet.cidr.clone(),
+            offset: u32::MAX,
+            largest_usable_offset: subnet.largest_usable_offset(),
+        })?;
+
+    subnet.static_ip(required_offset).map(|_| ())
+}
+
+fn static_bitcoind_ip(subnet: &Ipv4Subnet, group_index: usize) -> Result<String, SpawnError> {
+    let offset = first_static_ip_offset()
+        .checked_add(group_index as u32)
+        .ok_or_else(|| SpawnError::StaticIpUnavailable {
+            subnet: subnet.cidr.clone(),
+            offset: u32::MAX,
+            largest_usable_offset: subnet.largest_usable_offset(),
+        })?;
+    subnet.static_ip(offset)
+}
+
+fn static_lnd_ip(
+    subnet: &Ipv4Subnet,
+    chain_group_count: usize,
+    node_index: usize,
+) -> Result<String, SpawnError> {
+    let offset = first_static_ip_offset()
+        .checked_add(chain_group_count as u32)
+        .and_then(|offset| offset.checked_add(node_index as u32))
+        .ok_or_else(|| SpawnError::StaticIpUnavailable {
+            subnet: subnet.cidr.clone(),
+            offset: u32::MAX,
+            largest_usable_offset: subnet.largest_usable_offset(),
+        })?;
+    subnet.static_ip(offset)
+}
+
+fn first_static_ip_offset() -> u32 {
+    10
 }
 
 fn bitcoind_bridge_socket(
@@ -930,8 +1104,11 @@ fn empty_cleanup_report() -> CleanupReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{already_connected_response, btc_to_sat, chain_group_index, lnd_config};
-    use crate::LndError;
+    use super::{
+        Ipv4Subnet, already_connected_response, btc_to_sat, chain_group_index, lnd_config,
+        static_bitcoind_ip, static_lnd_ip,
+    };
+    use crate::{LndError, ManagedNetwork};
     use crate::{NodeConfig, RetryPolicy, SpawnLndConfig};
 
     #[test]
@@ -953,8 +1130,16 @@ mod tests {
             nodes_per_bitcoind: 3,
             keep_containers: false,
             startup_retry: RetryPolicy::new(12, 250),
+            cluster_subnet: None,
         };
-        let config = lnd_config("cluster-1", 2, &node, &spawn_config);
+        let network = ManagedNetwork {
+            id: "network-id".to_string(),
+            name: "spawn-lnd-cluster-1".to_string(),
+            subnet: "172.28.0.0/16".to_string(),
+        };
+        let subnet = Ipv4Subnet::parse(&network.subnet).expect("valid subnet");
+        let config =
+            lnd_config("cluster-1", 2, &node, &spawn_config, &network, &subnet).expect("config");
 
         assert_eq!(config.cluster_id, "cluster-1");
         assert_eq!(config.alias, "alice");
@@ -962,6 +1147,18 @@ mod tests {
         assert_eq!(config.image, "custom/lnd:v1");
         assert_eq!(config.extra_args, ["--alias=Alice", "--color=#3399ff"]);
         assert_eq!(config.startup_retry, RetryPolicy::new(12, 250));
+        assert_eq!(config.network.as_deref(), Some("spawn-lnd-cluster-1"));
+        assert_eq!(config.ipv4_address.as_deref(), Some("172.28.0.13"));
+    }
+
+    #[test]
+    fn assigns_static_ips_from_network_subnet() {
+        let subnet = Ipv4Subnet::parse("172.28.0.0/16").expect("valid subnet");
+
+        assert_eq!(static_bitcoind_ip(&subnet, 0).unwrap(), "172.28.0.10");
+        assert_eq!(static_bitcoind_ip(&subnet, 1).unwrap(), "172.28.0.11");
+        assert_eq!(static_lnd_ip(&subnet, 2, 0).unwrap(), "172.28.0.12");
+        assert_eq!(static_lnd_ip(&subnet, 2, 1).unwrap(), "172.28.0.13");
     }
 
     #[test]

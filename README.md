@@ -96,16 +96,18 @@ RUN_DOCKER_TESTS=1 cargo test --test e2e_smoke -- --nocapture
 RUN_DOCKER_TESTS=1 cargo test --test startup_failure_smoke -- --nocapture
 ```
 
-Check for leftover managed containers:
+Check for leftover managed Docker resources:
 
 ```sh
 docker ps -a --filter label=spawn-lnd=true
+docker network ls --filter label=spawn-lnd=true
 ```
 
-Remove all managed containers:
+Remove all managed containers and networks:
 
 ```sh
 docker rm -f $(docker ps -aq --filter label=spawn-lnd=true)
+docker network rm $(docker network ls -q --filter label=spawn-lnd=true)
 ```
 
 Keep containers for debugging failed tests:
@@ -120,16 +122,22 @@ container was created before readiness failed.
 ## Configuration
 
 The builder supports node aliases, image overrides, chain grouping, debug
-cleanup behavior, and startup retry policy:
+cleanup behavior, startup retry policy, and an optional managed Docker network
+subnet:
 
 ```rust
 use spawn_lnd::{RetryPolicy, SpawnLnd};
 
 let config = SpawnLnd::builder()
     .nodes(["alice", "bob"])
+    .cluster_subnet("172.28.0.0/16")
     .startup_retry_policy(RetryPolicy::new(600, 100))
     .build()?;
 ```
+
+By default, Docker chooses a non-overlapping subnet for each managed cluster
+network. `spawn-lnd` then assigns stable container IPs inside that network so
+Bitcoin Core and LND keep the same bridge addresses across container restarts.
 
 Environment overrides:
 
@@ -139,6 +147,7 @@ Environment overrides:
 - `SPAWN_LND_KEEP_CONTAINERS`
 - `SPAWN_LND_STARTUP_RETRY_ATTEMPTS`
 - `SPAWN_LND_STARTUP_RETRY_INTERVAL_MS`
+- `SPAWN_LND_CLUSTER_SUBNET`
 
 ## Startup Flags
 

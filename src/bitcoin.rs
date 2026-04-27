@@ -38,6 +38,10 @@ pub struct BitcoinCoreConfig {
     pub image: String,
     /// Retry policy used while waiting for RPC readiness.
     pub startup_retry: RetryPolicy,
+    /// Optional Docker network name.
+    pub network: Option<String>,
+    /// Optional static IPv4 address on the configured Docker network.
+    pub ipv4_address: Option<String>,
 }
 
 impl BitcoinCoreConfig {
@@ -48,6 +52,8 @@ impl BitcoinCoreConfig {
             group_index,
             image: DEFAULT_BITCOIND_IMAGE.to_string(),
             startup_retry: RetryPolicy::default(),
+            network: None,
+            ipv4_address: None,
         }
     }
 
@@ -60,6 +66,18 @@ impl BitcoinCoreConfig {
     /// Override the readiness retry policy.
     pub fn startup_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.startup_retry = policy;
+        self
+    }
+
+    /// Attach this Bitcoin Core container to a Docker network.
+    pub fn network(mut self, network: impl Into<String>) -> Self {
+        self.network = Some(network.into());
+        self
+    }
+
+    /// Assign a static IPv4 address on the configured Docker network.
+    pub fn ipv4_address(mut self, ip: impl Into<String>) -> Self {
+        self.ipv4_address = Some(ip.into());
         self
     }
 }
@@ -615,10 +633,19 @@ fn bitcoind_container_spec(config: &BitcoinCoreConfig, auth: &BitcoinRpcAuth) ->
     );
     let labels = managed_container_labels(&config.cluster_id, ContainerRole::Bitcoind, None);
 
-    ContainerSpec::new(name, config.image.clone())
+    let mut spec = ContainerSpec::new(name, config.image.clone())
         .cmd(bitcoind_args(auth))
         .labels(labels)
-        .expose_ports([BITCOIND_RPC_PORT, BITCOIND_P2P_PORT])
+        .expose_ports([BITCOIND_RPC_PORT, BITCOIND_P2P_PORT]);
+
+    if let Some(network) = &config.network {
+        spec = spec.network(network.clone());
+    }
+    if let Some(ipv4_address) = &config.ipv4_address {
+        spec = spec.ipv4_address(ipv4_address.clone());
+    }
+
+    spec
 }
 
 fn bitcoind_args(auth: &BitcoinRpcAuth) -> Vec<String> {
