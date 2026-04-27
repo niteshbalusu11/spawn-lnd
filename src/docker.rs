@@ -134,6 +134,73 @@ impl DockerClient {
         SpawnedContainer::from_inspect(response.id, inspect)
     }
 
+    /// Inspect an existing container and return refreshed metadata.
+    pub async fn inspect_container(
+        &self,
+        container_id: &str,
+    ) -> Result<SpawnedContainer, DockerError> {
+        let inspect = self
+            .docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await
+            .map_err(|source| DockerError::InspectContainer {
+                container_id: container_id.to_string(),
+                source,
+            })?;
+
+        SpawnedContainer::from_inspect(container_id.to_string(), inspect)
+    }
+
+    /// Stop an existing container. Already-stopped containers are treated as success.
+    pub async fn stop_container(&self, container_id: &str) -> Result<(), DockerError> {
+        let stop_options = StopContainerOptionsBuilder::new()
+            .t(STOP_TIMEOUT_SECONDS)
+            .build();
+
+        if let Err(source) = self
+            .docker
+            .stop_container(container_id, Some(stop_options))
+            .await
+            && !is_already_stopped_error(&source)
+        {
+            return Err(DockerError::StopContainer {
+                container_id: container_id.to_string(),
+                source,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Start an existing container and return refreshed metadata.
+    pub async fn start_container(
+        &self,
+        container_id: &str,
+    ) -> Result<SpawnedContainer, DockerError> {
+        if let Err(source) = self
+            .docker
+            .start_container(container_id, None::<StartContainerOptions>)
+            .await
+            && !is_ignorable_start_error(&source)
+        {
+            return Err(DockerError::StartContainer {
+                container_id: container_id.to_string(),
+                source,
+            });
+        }
+
+        self.inspect_container(container_id).await
+    }
+
+    /// Stop and start an existing container, returning refreshed metadata.
+    pub async fn restart_container(
+        &self,
+        container_id: &str,
+    ) -> Result<SpawnedContainer, DockerError> {
+        self.stop_container(container_id).await?;
+        self.start_container(container_id).await
+    }
+
     /// Create a managed Docker network and return its inspected metadata.
     pub async fn create_network(&self, spec: NetworkSpec) -> Result<ManagedNetwork, DockerError> {
         let response = self
@@ -435,7 +502,7 @@ impl DockerClient {
             .docker
             .stop_container(container_id, Some(stop_options))
             .await
-            && !is_ignorable_stop_error(&source)
+            && !is_ignorable_cleanup_stop_error(&source)
         {
             return Err(CleanupFailure::from_error(container_id, "stop", source));
         }
@@ -858,6 +925,12 @@ pub enum DockerError {
         source: BollardError,
     },
 
+    #[error("failed to stop Docker container {container_id}")]
+    StopContainer {
+        container_id: String,
+        source: BollardError,
+    },
+
     #[error("failed to inspect Docker container {container_id}")]
     InspectContainer {
         container_id: String,
@@ -1134,8 +1207,16 @@ fn append_log_output(logs: &mut String, output: LogOutput) {
     }
 }
 
-fn is_ignorable_stop_error(error: &BollardError) -> bool {
+fn is_already_stopped_error(error: &BollardError) -> bool {
+    matches!(docker_status_code(error), Some(304))
+}
+
+fn is_ignorable_cleanup_stop_error(error: &BollardError) -> bool {
     matches!(docker_status_code(error), Some(304 | 404))
+}
+
+fn is_ignorable_start_error(error: &BollardError) -> bool {
+    matches!(docker_status_code(error), Some(304))
 }
 
 fn is_not_found_error(error: &BollardError) -> bool {

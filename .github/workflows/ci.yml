@@ -26,6 +26,7 @@ jobs:
       - run: RUN_DOCKER_TESTS=1 cargo test --test bitcoind_smoke -- --nocapture
       - run: RUN_DOCKER_TESTS=1 cargo test --test lnd_smoke -- --nocapture
       - run: RUN_DOCKER_TESTS=1 cargo test --test cluster_smoke -- --nocapture
+      - run: RUN_DOCKER_TESTS=1 cargo test --test lifecycle_smoke -- --nocapture
       - run: RUN_DOCKER_TESTS=1 cargo test --test channel_smoke -- --nocapture
       - run: RUN_DOCKER_TESTS=1 cargo test --test e2e_smoke -- --nocapture
       - run: RUN_DOCKER_TESTS=1 cargo test --test startup_failure_smoke -- --nocapture

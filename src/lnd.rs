@@ -227,6 +227,56 @@ impl LndDaemon {
         })
     }
 
+    fn refresh_from_container(&mut self, container: SpawnedContainer) -> Result<(), LndError> {
+        let rpc_port =
+            container
+                .host_port(LND_GRPC_PORT)
+                .ok_or_else(|| LndError::MissingHostPort {
+                    container_id: container.id.clone(),
+                    container_port: LND_GRPC_PORT,
+                })?;
+        let p2p_port =
+            container
+                .host_port(LND_P2P_PORT)
+                .ok_or_else(|| LndError::MissingHostPort {
+                    container_id: container.id.clone(),
+                    container_port: LND_P2P_PORT,
+                })?;
+
+        self.rpc_socket = format!("127.0.0.1:{rpc_port}");
+        self.p2p_socket = format!("127.0.0.1:{p2p_port}");
+        self.container = container;
+        Ok(())
+    }
+
+    /// Stop the LND container without removing it.
+    pub async fn stop(&self, docker: &DockerClient) -> Result<(), LndError> {
+        docker.stop_container(&self.container.id).await?;
+        Ok(())
+    }
+
+    /// Start the LND container and wait until it is synced to chain.
+    pub async fn start(
+        &mut self,
+        docker: &DockerClient,
+        policy: &RetryPolicy,
+    ) -> Result<GetInfoResponse, LndError> {
+        let container = docker.start_container(&self.container.id).await?;
+        self.refresh_from_container(container)?;
+        self.wait_synced_to_chain_with_policy(policy).await
+    }
+
+    /// Restart the LND container and wait until it is synced to chain.
+    pub async fn restart(
+        &mut self,
+        docker: &DockerClient,
+        policy: &RetryPolicy,
+    ) -> Result<GetInfoResponse, LndError> {
+        let container = docker.restart_container(&self.container.id).await?;
+        self.refresh_from_container(container)?;
+        self.wait_synced_to_chain_with_policy(policy).await
+    }
+
     /// Build an `lnd_grpc_rust` connection config for this node.
     pub fn node_config(&self) -> LndNodeConfig {
         LndNodeConfig::new(
